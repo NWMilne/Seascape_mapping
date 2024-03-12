@@ -1,0 +1,3626 @@
+---
+title: "NWMilne_methods"
+author: "NWM"
+date: "2023-10-11"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+## R packages 
+```{r Packages,message=FALSE,warning=FALSE}
+rm(list=ls())
+
+library(plyr)
+library(arm)
+library(sf)
+library(raster)
+library(mgcv)
+library(tidyverse)
+library(mapproj)
+require(ggplot2)
+require(reshape)
+
+```
+
+## Loading in Data
+```{r Loading Abundance Data 2020 Gadoids}
+getwd()
+substrate.landscape <- read.csv("Landscape_data.csv")
+names(substrate.landscape)
+
+```
+
+## Loading in MPA area shp files and data
+```{r MPA data}
+
+library(raster)
+library(sp)
+library(rgdal)
+# load in the shapefile for shoreline
+UKRDS <- readRDS("gadm36_GBR_3_sf.rds")
+
+# subsetting sf
+UKRDS_df <- ggplot2::fortify(UKRDS, region = "NAME_1")
+list(UKRDS_df)
+Scotland <- subset(UKRDS_df, NAME_1 %in% c("Scotland"))
+list(Scotland)
+Ayrshire <- subset(Scotland, NAME_2 %in% c("North Ayrshire"))
+Ayrshire
+st_crs(Ayrshire)
+
+r1 <- raster("Rasters/SouthArran_bathy.tif") #import 1 sec raster of depth
+r1
+par(mfrow=c(1,1))
+par(mar = c(3,3,3,3))
+plot(r1)
+
+#### Importing and cropping all rasters & shapefiles #### 
+# cropping to the MPA extent
+e <- as(extent(-5.45, -4.95, 55.35, 55.58), 'SpatialPolygons')
+crs(e) <- "+proj=longlat +datum=WGS84 +no_defs"
+r <- crop(r1, e) # crop using a spatial polygon box crop
+r
+plot(r)
+crs(r) <- "+init=EPSG:4326" 
+r
+
+## spatial polygons and rasters - note this uses sf not sp
+measures = rgdal::readOGR("Shapefiles/South_arran_measures")
+measures
+measures@proj4string # check crs
+crs(measures)
+# reproject the vector data to match the raster
+measures <- spTransform(measures,
+                        crs(r))
+measures2 <- st_as_sf(measures)
+
+names(substrate.landscape)
+xy <- substrate.landscape[,c(6,5)]
+
+pt <- SpatialPointsDataFrame(coords = xy, data = substrate.landscape,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+
+# plot all together
+plot(r)
+plot(measures, add=TRUE)
+plot(pt, add=TRUE, pch=19, col="red", cex=0.5)
+
+
+## crop the land polygo in by the extent of the area of study
+e1 <- st_as_sf(e)
+st_crs(e1)==st_crs(Ayrshire)
+cropped<-st_crop(Ayrshire$geometry, e1$geometry)
+plot(cropped)
+cropped
+cropped2 <- sf:::as_Spatial(cropped) # if we need a sp on sf object
+plot(cropped2)
+class(cropped2)
+summary(cropped2)
+
+## export sf shp for later if needed
+#st_write(cropped, dsn = "Arran_cropped", layer = "cropped", driver = "ESRI Shapefile")
+Arran <- st_read("Shapefiles/Arran_cropped")
+plot(Arran)
+## created land ploygon of the are we are working on - this can now be used as a mask
+# mask of the bathy raster by polygon
+plot(r)
+r
+plot(cropped2, add=TRUE)
+masked.bathy <- raster::mask(r,measures) # remove areas outside MPA
+masked.bathy
+plot(masked.bathy)
+plot(cropped2, add=TRUE)
+plot(measures, add=TRUE)
+plot(pt, add=TRUE, pch=19, col="red", cex=0.5)
+
+## save the masked bathy for use later
+#writeRaster(masked,'bathy_masked.tif')
+
+## do distance to shore for all UoG points
+## get the UoG poiints
+
+Sites <- read.csv("SBRUV_all_years.csv")
+
+Sites[is.na(Sites)] <- 0
+
+xy2 <- Sites[,c(8,7)]
+
+points_sites <- SpatialPointsDataFrame(coords = xy2, data = Sites,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+proj4string(points_sites) <- CRS("+init=EPSG:4326")
+summary(points_sites)
+points_sites <- spTransform(points_sites, CRS("+init=epsg:32630")) # projecting
+summary(points_sites)
+
+the_crs <- "+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs"
+cropped_trans <- st_transform(cropped, crs= the_crs)
+
+r_trans <- projectRaster(r, crs=the_crs)
+r_trans
+
+## needs to be sf object
+UoG_sf <- st_as_sf(points_sites)
+UoG_sf.points <- UoG_sf %>% select(Station,Longitude, Latitude)
+UoG_sf.points <- tibble::rowid_to_column(UoG_sf.points, "ID")
+UoG_sf.points
+## getting distacne to shore for all points
+dist <- st_distance(UoG_sf.points, cropped_trans)
+dist <- as.data.frame(dist)
+dist <- tibble::rowid_to_column(dist, "ID")
+
+#combine initial data with distance to coastline
+test.sites <- merge(x=UoG_sf.points, y=dist, "ID")
+Sites <- merge(x=Sites, y=test.sites, "Station")
+Sites <- Sites[ -c(26,27,28,30) ] # duplicate column removed
+names(Sites)[7] <- "Latitude"
+names(Sites)[8] <- "Longitude"
+names(Sites)
+#write.table(Sites,file="All_years_meta.csv", append=FALSE, sep= ",", row.names = FALSE, col.names=TRUE) # if exported file needed
+
+measures2 # tidy up the limits classifications
+measures2$Limits <- recode_factor(measures2$Limits, "All fishing" ="NTZ", #No Take Zone
+                                "Beam Trawling" = "BT", 
+                                "Demersal trawl & dredge" = "TND",
+                                "Demersal trawl dredge & cree" ="DTDC",
+                                "Demersal trawl dredge & creel" ="DTDC")
+
+
+```
+
+## Kriging - Algae
+```{r algae krig the substrate coverage}
+library(gstat)
+#### all the points and shp ####
+names(substrate.landscape)
+
+xy <- substrate.landscape[,c(6,5)]
+
+points_spatial <- SpatialPointsDataFrame(coords = xy, data = substrate.landscape,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+proj4string(points_spatial) <- CRS("+init=EPSG:4326")
+summary(points_spatial)
+points_spatial <- spTransform(points_spatial, CRS("+init=epsg:32630")) # projecting
+summary(points_spatial)
+
+names(substrate.landscape)
+xy <- substrate.landscape[,c(6,5)]
+
+points_spatial_noproj <- SpatialPointsDataFrame(coords = xy, data = substrate.landscape,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+
+summary(points_spatial_noproj)
+
+library(geoR)
+library(rgeos)
+library(automap)
+
+##### variogram for algae #####
+vgm1 <- variogram(Algae~1, data=points_spatial_noproj) #create variogram
+vgm1
+# make variogram fit, using automatic selection
+vgm1.fit <- fit.variogram(vgm1, vgm(c("Exp", "Sph")), fit.kappa = TRUE) 
+#fit variogram with spherical model
+vgm1.fit
+plot(vgm1,vgm1.fit) # plot fitted variogram
+
+## import shapefile for area to perform the kriging - using the MPA boundaries
+measures = rgdal::readOGR("Shapefiles/South_arran_measures") # polygon of fishing measures in MPA
+crs(measures)
+measures <- spTransform(measures,
+                        crs(points_spatial_noproj)) # check the crs
+
+# draw location at which krig pref created - using the same number of points as the extracted bathy point layer 
+measures.reg <- spsample(measures, 513971, type="regular") 
+#convert to spatial pixels
+measures.grid <- SpatialPixels(measures.reg) 
+summary(measures.grid)
+
+# other projected version if needed
+measures.grid.2 <- spTransform(measures.grid,
+                        crs(points_spatial)) 
+summary(measures.grid.2)
+
+# colours for mapping later
+color.pal <- colorRampPalette(c("dark red", "orange", "light yellow"))
+color.palr <- colorRampPalette(c("light yellow", "orange", "dark red"))
+
+
+##### automatic version of kriging ####
+## this needs to be projected using utm 30N
+
+#### Ordinary kriging, with new_data object - MPA boundary ###
+
+algae.var <- variogram(Algae ~1, points_spatial)
+Exp.vari.algae <- autofitVariogram(Algae~1, points_spatial, model="Exp")
+Gau.vari.algae <- autofitVariogram(Algae~1, points_spatial, model="Gau")
+Sph.vari.algae <- autofitVariogram(Algae~1, points_spatial, model="Sph")
+Ste.vari.algae <- autofitVariogram(Algae~1, points_spatial, model="Ste")
+plot(Exp.vari.algae) # sserr 1.181095e-06
+plot(Gau.vari.algae) # sserr 2.95192e-06
+plot(Sph.vari.algae) # sserr 2.482455e-06
+plot(Ste.vari.algae) # sserr 1.104905e-06 
+
+kriging.algae2 <- autoKrige(Algae~1, 
+                            input_data=points_spatial, 
+                            new_data=measures.grid.2,
+                            remove_duplicates = TRUE,
+                            verbose = TRUE,
+                            GLS.model = TRUE)
+
+summary(kriging.algae2)
+(kriging.algae2)$sser 
+class(kriging.algae2$krige_output)
+auto.algae.output <- (kriging.algae2$krige_output[,"var1.pred"])
+summary(auto.algae.output)
+
+#### algae Cross Validation ####
+## the model from automap object to use in CV
+a1 <- kriging.algae2$var_model
+# 5 fold CV
+algae.krg.cv <- krige.cv(Algae~1, points_spatial, a1, nfold=5)
+summary(algae.krg.cv)
+# mean error, ideally 0: 
+mean(algae.krg.cv$residual, na.rm=TRUE) 
+# MSPE, ideally small
+mean(algae.krg.cv$residual^2, na.rm=TRUE) 
+# Mean square normalized error, ideally close to 1
+mean(algae.krg.cv$zscore^2, na.rm=TRUE) 
+# correlation observed and predicted, ideally 1
+var(algae.krg.cv$observed, algae.krg.cv$observed - algae.krg.cv$residual, use = "na.or.complete", na.rm=TRUE) 
+# correlation predicted and residual, ideally 0
+var(algae.krg.cv$observed - algae.krg.cv$residual, algae.krg.cv$residual,use = "na.or.complete", na.rm=TRUE) 
+
+# look at the predction and variance
+par(mfrow=c(1,4))
+
+hist(algae.krg.cv$var1.pred,nclass=20, col="green4", main="predicted")
+hist(algae.krg.cv$var1.var, nclass=20, col="salmon", main="variation")
+hist(algae.krg.cv$observed, nclass=20, col="light blue", main="observed")
+hist(algae.krg.cv$residual, nclass=20, col="yellow", main="residuals")
+
+
+#### make an irregular raster of krig output ####
+#(yay irregular rasters)
+library("raster")
+library("akima")
+library(data.table)
+auto.algae.output.table <- data.table(as.data.frame(auto.algae.output, xy = TRUE))
+setnames(auto.algae.output.table, "var1.pred", "Algae")
+setnames(auto.algae.output.table, "x1", "Longitude")
+setnames(auto.algae.output.table, "x2", "Latitude")
+attributes(auto.algae.output.table)
+
+steps <- 1000
+isu_algae <- with(auto.algae.output.table, interp(Longitude, Latitude, Algae , 
+    xo=seq(min(Longitude), max(Longitude), length = steps),
+    yo=seq(min(Latitude), max(Latitude), length = steps)
+))
+
+par(mfrow=c(1,1))
+auto.algae.output.raster <- raster(isu_algae)
+plot(auto.algae.output.raster)
+crs(auto.algae.output.raster) <- "+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs"
+# Convert to degrees
+auto.algae.output.raster <- projectRaster(auto.algae.output.raster, crs='+proj=longlat +datum=WGS84') 
+
+# mask of the raster by polygon
+plot(auto.algae.output.raster)
+plot(cropped2, add=TRUE)
+auto.algae.output.raster
+masked.bathy # checking this all matches to same crs and prjections and the depth
+
+masked.auto.algae <- raster::mask(auto.algae.output.raster,cropped2, inverse=TRUE) # remove areas on land
+masked.auto.algae
+names(masked.auto.algae) <- "Algae"
+
+plot(masked.auto.algae)
+plot(cropped2, add=TRUE)
+plot(measures, add=TRUE)
+plot(pt, add=TRUE, pch=19, col="red", cex=0.5)
+
+# save it
+##writeRaster(masked.auto.algae,'auto.algae_krig.tif')
+
+```
+
+## kriging - Mud
+```{r kriging - mud}
+
+library(gstat)
+library(geoR)
+library(automap)
+
+##### variogram for mud #####
+
+mud.var <- variogram(Mud ~1, points_spatial)
+Exp.vari.mud <- autofitVariogram(Mud~1, points_spatial, model="Exp")
+Gau.vari.mud <- autofitVariogram(Mud~1, points_spatial, model="Gau")
+Sph.vari.mud <- autofitVariogram(Mud~1, points_spatial, model="Sph")
+Ste.vari.mud <- autofitVariogram(Mud~1, points_spatial, model="Ste")
+plot(Exp.vari.mud) # sserr 1.24846e-06
+plot(Gau.vari.mud) # sserr 3.452347e-06
+plot(Sph.vari.mud) # sserr 7.394504e-07
+plot(Ste.vari.mud) # sserr 1.175886e-06 # closest to 1
+
+kriging.mud2 <- autoKrige(Mud~1, 
+                            input_data=points_spatial, 
+                            new_data=measures.grid.2,
+                            model = c("Exp", "Gau", "Sph","Ste"),
+                            remove_duplicates = TRUE,
+                            verbose = TRUE,
+                            GLS.model = TRUE)
+kriging.mud2
+
+summary(kriging.mud2)
+(kriging.mud2)$sser ## sum of squares 7.394504e-07
+class(kriging.mud2$krige_output)
+auto.mud.output <- (kriging.mud2$krige_output[,"var1.pred"])
+summary(auto.mud.output)
+
+#### Mud Cross Validation ####
+## the model from automap object to use in CV
+m1 <- kriging.mud2$var_model
+# 5 fold CV
+mud.krg.cv <- krige.cv(Mud~1, points_spatial, m1, nfold=5)
+summary(mud.krg.cv)
+# mean error, ideally 0: 
+mean(mud.krg.cv$residual, na.rm=TRUE) # -0.0006460628
+# MSPE, ideally small
+mean(mud.krg.cv$residual^2, na.rm=TRUE) # 0.01252465
+# Mean square normalized error, ideally close to 1
+mean(mud.krg.cv$zscore^2, na.rm=TRUE) # 1.362884
+# correlation observed and predicted, ideally 1
+var(mud.krg.cv$observed, mud.krg.cv$observed - mud.krg.cv$residual, use = "na.or.complete", na.rm=TRUE) # 0.05711966
+# correlation predicted and residual, ideally 0
+var(mud.krg.cv$observed - mud.krg.cv$residual, mud.krg.cv$residual,use = "na.or.complete", na.rm=TRUE) # -0.00286353
+
+# look at the predction and variance
+par(mfrow=c(1,4))
+
+hist(mud.krg.cv$var1.pred,nclass=20, col="green4", main="predicted")
+hist(mud.krg.cv$var1.var, nclass=20, col="salmon", main="variation")
+hist(mud.krg.cv$observed, nclass=20, col="light blue", main="observed")
+hist(mud.krg.cv$residual, nclass=20, col="yellow", main="residuals")
+
+##### making a raster from output ####
+library(data.table)
+library("raster")
+library("akima")
+
+auto.mud.output.table <- data.table(as.data.frame(auto.mud.output, xy = TRUE))
+setnames(auto.mud.output.table, "var1.pred", "Mud")
+setnames(auto.mud.output.table, "x1", "Longitude")
+setnames(auto.mud.output.table, "x2", "Latitude")
+attributes(auto.mud.output.table)
+
+steps <- 1000
+isu_mud <- with(auto.mud.output.table, interp(Longitude, Latitude, Mud , 
+    xo=seq(min(Longitude), max(Longitude), length = steps),
+    yo=seq(min(Latitude), max(Latitude), length = steps)
+))
+par(mfrow=c(1,1))
+auto.mud.output.raster <- raster(isu_mud)
+plot(auto.mud.output.raster)
+crs(auto.mud.output.raster) <- "+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs"
+# Convert to degrees
+auto.mud.output.raster <- projectRaster(auto.mud.output.raster, crs='+proj=longlat +datum=WGS84') 
+
+# mask of the raster by polygon
+plot(auto.mud.output.raster)
+plot(cropped2, add=TRUE)
+auto.mud.output.raster
+
+masked.auto.mud <- mask(auto.mud.output.raster,cropped2, inverse=TRUE) # remove areas on land
+names(masked.auto.mud) <- "Mud"
+
+plot(masked.auto.mud)
+plot(cropped2, add=TRUE)
+plot(measures, add=TRUE)
+plot(pt, add=TRUE, pch=19, col="red", cex=0.5)
+
+# save it
+#writeRaster(masked.auto.mud,'auto.mud_krig.tif')
+
+
+```
+
+## kriging - Pebble
+```{r kriging - Pebble}
+
+library(gstat)
+library(geoR)
+library(automap)
+
+##### variogram for pebble #####
+
+pebble.var <- variogram(Pebble ~1, points_spatial)
+Exp.vari.pebble <- autofitVariogram(Pebble~1, points_spatial, model="Exp")
+Gau.vari.pebble<- autofitVariogram(Pebble~1, points_spatial, model="Gau")
+Sph.vari.pebble <- autofitVariogram(Pebble~1, points_spatial, model="Sph")
+Ste.vari.pebble <- autofitVariogram(Pebble~1, points_spatial, model="Ste")
+Sph.vari.pebble$sserr
+plot(Exp.vari.pebble) # sserr 1.042098e-07
+plot(Gau.vari.pebble) # sserr 1.281976e-07
+plot(Sph.vari.pebble) # sserr 1.266971e-07
+plot(Ste.vari.pebble) # sserr 9.769807e-08
+
+# Ordinary kriging, with new_data object - MPA boundary
+
+kriging.pebble.2 <- autoKrige(Pebble~1, 
+                            input_data=points_spatial, 
+                            new_data=measures.grid.2,
+                            model = c("Exp", "Gau", "Sph","Ste"),
+                            remove_duplicates = TRUE,
+                            verbose = TRUE,
+                            GLS.model = TRUE)
+
+
+#plot(kriging.pebble.2) irregular raster plot do in akima
+summary(kriging.pebble.2)
+(kriging.pebble.2)$sser ## sum of squares 1.042098e-07
+class(kriging.pebble.2$krige_output)
+auto.pebble.output <- (kriging.pebble.2$krige_output[,"var1.pred"])
+summary(auto.pebble.output)
+
+#### pebble Cross Validation ####
+## the model from automap object to use in CV
+p1 <- kriging.pebble.2$var_model
+# 5 fold CV
+pebble.krg.cv <- krige.cv(Pebble~1, points_spatial, p1, nfold=5)
+summary(pebble.krg.cv)
+  # mean error, ideally 0: 
+mean(pebble.krg.cv$residual, na.rm=TRUE) # 0.008253938
+# MSPE, ideally small
+mean(pebble.krg.cv$residual^2, na.rm=TRUE) # 0.02100819
+# Mean square normalized error, ideally close to 1
+mean(pebble.krg.cv$zscore^2, na.rm=TRUE) # 59306661762
+# correlation observed and predicted, ideally 1
+var(pebble.krg.cv$observed, pebble.krg.cv$observed - pebble.krg.cv$residual, use = "na.or.complete", na.rm=TRUE) # 0.001215894
+# correlation predicted and residual, ideally 0
+var(pebble.krg.cv$observed - pebble.krg.cv$residual, pebble.krg.cv$residual,use = "na.or.complete", na.rm=TRUE) # -0.0004152981
+
+# look at the predction and variance
+par(mfrow=c(1,4))
+
+hist(pebble.krg.cv$var1.pred,nclass=20, col="green4", main="predicted")
+hist(pebble.krg.cv$var1.var, nclass=20, col="salmon", main="variation")
+hist(pebble.krg.cv$observed, nclass=20, col="light blue", main="observed")
+hist(pebble.krg.cv$residual, nclass=20, col="yellow", main="residuals")
+
+##### making a raster from output #####
+
+library("raster")
+library("akima")
+
+auto.pebble.output.table <- data.table(as.data.frame(auto.pebble.output, xy = TRUE))
+setnames(auto.pebble.output.table, "var1.pred", "Pebble")
+setnames(auto.pebble.output.table, "x1", "Longitude")
+setnames(auto.pebble.output.table, "x2", "Latitude")
+attributes(auto.pebble.output.table)
+auto.pebble.output.table$Pebble[auto.pebble.output.table$Pebble<0] <- 0 
+
+## the output is an irregaulr grid so having issues turning it into a raster, creating a regualr grid to coerce into a raster
+steps <- 1000
+isu_peb <- with(auto.pebble.output.table, interp(Longitude, Latitude, Pebble , 
+    xo=seq(min(Longitude), max(Longitude), length = steps),
+    yo=seq(min(Latitude), max(Latitude), length = steps)
+))
+par(mfrow=c(1,1))
+auto.pebble.output.raster <- raster(isu_peb)
+plot(auto.pebble.output.raster)
+crs(auto.pebble.output.raster) <- "+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs"
+# Convert to degrees
+auto.pebble.output.raster <- projectRaster(auto.pebble.output.raster, crs='+proj=longlat +datum=WGS84') 
+
+# mask of the raster by polygon
+plot(auto.pebble.output.raster)
+plot(cropped2, add=TRUE)
+auto.pebble.output.raster
+
+masked.auto.pebble <- mask(auto.pebble.output.raster,cropped2, inverse=TRUE) # remove areas on land
+names(masked.auto.pebble) <- "Pebble"
+
+plot(masked.auto.pebble)
+plot(cropped2, add=TRUE)
+plot(measures, add=TRUE)
+plot(pt, add=TRUE, pch=19, col="red", cex=0.5)
+
+# save it
+#writeRaster(masked.auto.pebble,'auto.pebble_krig.tif')
+
+```
+
+## kriging - Gravel
+```{r kriging - Gravel}
+
+library(gstat)
+library(geoR)
+library(automap)
+
+##### variogram for gravel #####
+
+gravel.var <- variogram(Gravel ~1, points_spatial)
+Exp.vari.gravel <- autofitVariogram(Gravel~1, points_spatial, model="Exp")
+Gau.vari.gravel<- autofitVariogram(Gravel~1, points_spatial, model="Gau")
+Sph.vari.gravel <- autofitVariogram(Gravel~1, points_spatial, model="Sph")
+Ste.vari.gravel <- autofitVariogram(Gravel~1, points_spatial, model="Ste")
+Ste.vari.gravel$sserr
+plot(Exp.vari.gravel) # sserr 6.241609e-07
+plot(Gau.vari.gravel) # sserr 2.011082e-06
+plot(Sph.vari.gravel) # sserr 8.132098e-07
+plot(Ste.vari.gravel) # sserr 5.878926e-07
+
+
+##### automatic vesion ##
+# Ordinary kriging, with new_data object - MPA boundary
+
+
+kriging.gravel.2 <- autoKrige(Gravel~1, 
+                            input_data=points_spatial, 
+                            new_data=measures.grid.2,
+                            model = c("Exp", "Gau", "Sph","Ste"),
+                            remove_duplicates = TRUE,
+                            verbose = TRUE,
+                            GLS.model = TRUE)
+
+summary(kriging.gravel.2)
+(kriging.gravel.2)$sser ## sum of squares 5.878926e-07
+class(kriging.gravel.2$krige_output)
+
+auto.gravel.output <- (kriging.gravel.2$krige_output[,"var1.pred"])
+summary(auto.gravel.output)
+
+#### gravel Cross Validation ####
+## the model from automap object to use in CV
+g1 <- kriging.gravel.2$var_model
+# 5 fold CV
+gravel.krg.cv <- krige.cv(Gravel~1, points_spatial, g1, nfold=5)
+summary(gravel.krg.cv)
+# mean error, ideally 0: 
+mean(gravel.krg.cv$residual, na.rm=TRUE) # -0.0002993453
+# MSPE, ideally small
+mean(gravel.krg.cv$residual^2, na.rm=TRUE) # 0.05060314
+# Mean square normalized error, ideally close to 1
+mean(gravel.krg.cv$zscore^2, na.rm=TRUE) # 0.9517918
+# correlation observed and predicted, ideally 1
+var(gravel.krg.cv$observed, gravel.krg.cv$observed - gravel.krg.cv$residual, use = "na.or.complete", na.rm=TRUE) # 0.0266752
+# correlation predicted and residual, ideally 0
+var(gravel.krg.cv$observed - gravel.krg.cv$residual, gravel.krg.cv$residual,use = "na.or.complete", na.rm=TRUE) # 0.004313215
+
+# look at the predction and variance
+par(mfrow=c(1,4))
+
+hist(gravel.krg.cv$var1.pred,nclass=20, col="green4", main="predicted")
+hist(gravel.krg.cv$var1.var, nclass=20, col="salmon", main="variation")
+hist(gravel.krg.cv$observed, nclass=20, col="light blue", main="observed")
+hist(gravel.krg.cv$residual, nclass=20, col="yellow", main="residuals")
+
+##### making a raster from output #####
+library("raster")
+library("akima")
+
+auto.gravel.output.table <- data.table(as.data.frame(auto.gravel.output, xy = TRUE))
+setnames(auto.gravel.output.table, "var1.pred", "Gravel")
+setnames(auto.gravel.output.table, "x1", "Longitude")
+setnames(auto.gravel.output.table, "x2", "Latitude")
+attributes(auto.gravel.output.table)
+
+
+steps <- 1000
+isu_grav <- with(auto.gravel.output.table, interp(Longitude, Latitude, Gravel , 
+    xo=seq(min(Longitude), max(Longitude), length = steps),
+    yo=seq(min(Latitude), max(Latitude), length = steps)
+))
+
+par(mfrow=c(1,1))
+auto.gravel.output.raster <- raster(isu_grav)
+plot(auto.gravel.output.raster)
+crs(auto.gravel.output.raster) <- "+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs"
+# Convert to degrees
+auto.gravel.output.raster <- projectRaster(auto.gravel.output.raster, crs='+proj=longlat +datum=WGS84') 
+
+# mask of the raster by polygon
+par(mfrow=c(1,1))
+plot(auto.gravel.output.raster)
+plot(cropped2, add=TRUE)
+auto.gravel.output.raster
+
+masked.auto.gravel <- mask(auto.gravel.output.raster,cropped2, inverse=TRUE) # remove areas on land
+names(masked.auto.gravel) <- "Gravel"
+par(mfrow=c(1,1))
+plot(masked.auto.gravel)
+plot(cropped2, add=TRUE)
+plot(measures, add=TRUE)
+plot(pt, add=TRUE, pch=19, col="red", cex=0.5)
+
+# save it
+#writeRaster(masked.auto.gravel,'auto.gravel_krig.tif')
+
+```
+
+## kriging - Sand
+```{r kriging - Sand}
+
+library(gstat)
+library(geoR)
+library(automap)
+
+##### variogram for sand #####
+
+sand.var <- variogram(Sand ~1, points_spatial)
+Exp.vari.sand <- autofitVariogram(Sand~1, points_spatial, model="Exp")
+Gau.vari.sand<- autofitVariogram(Sand~1, points_spatial, model="Gau")
+Sph.vari.sand <- autofitVariogram(Sand~1, points_spatial, model="Sph")
+Ste.vari.sand <- autofitVariogram(Sand~1, points_spatial, model="Ste")
+Ste.vari.sand$sserr
+plot(Exp.vari.gravel) # sserr 1.795518e-06
+plot(Gau.vari.gravel) # sserr 4.386744e-06
+plot(Sph.vari.gravel) # sserr 2.134802e-06
+plot(Ste.vari.gravel) # sserr 1.734041e-06
+
+# Ordinary kriging, with new_data object - MPA boundary
+
+kriging.sand.2 <- autoKrige(Sand~1, 
+                            input_data=points_spatial, 
+                            new_data=measures.grid.2,
+                            model = c("Exp", "Gau", "Sph","Ste"),
+                            remove_duplicates = TRUE,
+                            verbose = TRUE,
+                            GLS.model = TRUE)
+
+summary(kriging.sand.2)
+(kriging.sand.2)$sser ## sum of squares 1.734041e-06
+class(kriging.sand.2$krige_output)
+auto.sand.output <- (kriging.sand.2$krige_output[,"var1.pred"])
+summary(auto.sand.output)
+
+#### sand Cross Validation ####
+## the model from automap object to use in CV
+s1 <- kriging.sand.2$var_model
+# 5 fold CV
+sand.krg.cv <- krige.cv(Sand~1, points_spatial, s1, nfold=5)
+summary(sand.krg.cv)
+# mean error, ideally 0: 
+mean(sand.krg.cv$residual, na.rm=TRUE) #  -0.01059653
+# MSPE, ideally small
+mean(sand.krg.cv$residual^2, na.rm=TRUE) # 0.07159397
+# Mean square normalized error, ideally close to 1
+mean(sand.krg.cv$zscore^2, na.rm=TRUE) # 0.9070276
+# correlation observed and predicted, ideally 1
+var(sand.krg.cv$observed, sand.krg.cv$observed - sand.krg.cv$residual, use = "na.or.complete", na.rm=TRUE) # 0.03088671
+# correlation predicted and residual, ideally 0
+var(sand.krg.cv$observed - sand.krg.cv$residual, sand.krg.cv$residual,use = "na.or.complete", na.rm=TRUE) # -0.0001475891
+
+# look at the predction and variance
+par(mfrow=c(1,4))
+
+hist(sand.krg.cv$var1.pred,nclass=20, col="green4", main="predicted")
+hist(sand.krg.cv$var1.var, nclass=20, col="salmon", main="variation")
+hist(sand.krg.cv$observed, nclass=20, col="light blue", main="observed")
+hist(sand.krg.cv$residual, nclass=20, col="yellow", main="residuals")
+
+##### making a raster from output #####
+library("raster")
+library("akima")
+
+auto.sand.output.table <- data.table(as.data.frame(auto.sand.output, xy = TRUE))
+setnames(auto.sand.output.table, "var1.pred", "Sand")
+setnames(auto.sand.output.table, "x1", "Longitude")
+setnames(auto.sand.output.table, "x2", "Latitude")
+auto.sand.output.table$Sand[auto.sand.output.table$Sand<0] <- 0 # setting the negative value to zero
+attributes(auto.sand.output.table)
+
+
+steps <- 1000
+isu_sand <- with(auto.sand.output.table, interp(Longitude, Latitude, Sand , 
+    xo=seq(min(Longitude), max(Longitude), length = steps),
+    yo=seq(min(Latitude), max(Latitude), length = steps)
+))
+
+auto.sand.output.raster <- raster(isu_sand)
+par(mfrow=c(1,1))
+plot(auto.sand.output.raster)
+crs(auto.sand.output.raster) <- "+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs"
+# Convert to degrees
+auto.sand.output.raster <- projectRaster(auto.sand.output.raster, crs='+proj=longlat +datum=WGS84') 
+
+# mask of the raster by polygon
+
+plot(auto.sand.output.raster)
+plot(cropped2, add=TRUE)
+auto.sand.output.raster
+
+masked.auto.sand <- mask(auto.sand.output.raster,cropped2, inverse=TRUE) # remove areas on land
+names(masked.auto.sand) <- "Sand"
+plot(masked.auto.sand)
+plot(cropped2, add=TRUE)
+plot(measures, add=TRUE)
+plot(pt, add=TRUE, pch=19, col="red", cex=0.5)
+
+# save it
+#writeRaster(masked.auto.sand,"auto.sand_krig.tif", overwrite=TRUE)
+
+```
+
+## kriging - Biodiversity Indices
+```{r kriging - Biodiversity Indices}
+
+#### First need to calculate biodiversity for each of the sites
+library(rdiversity)
+library(tibble)
+library(dplyr)
+dat <- read.csv("Allyears_SBRUV_species.csv") %>%
+  tibble::column_to_rownames("Species")
+
+#### loading in the data for sites that are SBRUV where species were recorded  ####
+
+Sites.UoG <- subset(substrate.landscape, Source %in% c("UOG"))
+
+meta <- metacommunity(dat)
+res <- norm_sub_alpha(meta, 0:10)
+
+species_richness <- res %>% filter(q == 0)
+simpson_diversity <- res %>% filter(q == 2)
+
+simpson <- dplyr::select(simpson_diversity, partition_name, diversity)
+
+names(simpson)
+names(simpson)[1] <- "Station"
+names(simpson)[2] <- "Simpson"
+
+Sites.UoG <- merge(x=Sites.UoG, y=simpson, "Station")
+
+Species.richness <- dplyr::select(species_richness, partition_name, diversity)
+
+names(Species.richness)
+names(Species.richness)[1] <- "Station"
+names(Species.richness)[2] <- "Species.richness"
+
+Sites.UoG <- merge(x=Sites.UoG, y=Species.richness, "Station")
+head(Sites.UoG)
+
+# save it
+#write.csv(Sites.UoG,"meta_inc_Diversity.csv", row.names = FALSE)
+
+#### now do estimates of the biodiversity through the MPA ####
+
+library(gstat)
+library(geoR)
+library(rgeos)
+library(automap)
+library(raster)
+
+names(Sites.UoG)
+Sites.UoG[is.na(Sites.UoG)] <- 0
+
+xy2 <- Sites.UoG[,c(6,5)]
+
+points_UoG <- SpatialPointsDataFrame(coords = xy2, data = Sites.UoG,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+proj4string(points_UoG) <- CRS("+init=EPSG:4326")
+summary(points_UoG)
+points_UoG <- spTransform(points_UoG, CRS("+init=epsg:32630")) # projecting
+summary(points_UoG)
+
+## no projected version as well
+points_spatial_noproj <- SpatialPointsDataFrame(coords = xy2, data = Sites.UoG,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+
+summary(points_spatial_noproj)
+
+##### Simpson automatic vesion #####
+
+Simpson.var <- variogram(Simpson ~1, points_UoG)
+Exp.vari.Simpson <- autofitVariogram(Simpson~1, points_UoG, model="Exp")
+Gau.vari.Simpson <- autofitVariogram(Simpson~1, points_UoG, model="Gau")
+Sph.vari.Simpson <- autofitVariogram(Simpson~1, points_UoG, model="Sph")
+Ste.vari.Simpson <- autofitVariogram(Simpson~1, points_UoG, model="Ste")
+Exp.vari.Simpson$sserr
+plot(Exp.vari.Simpson) # sserr 0.0003949304
+plot(Gau.vari.Simpson) # sserr 0.0003456663
+plot(Sph.vari.Simpson) # sserr 0.0003694602
+plot(Ste.vari.Simpson) # sserr 0.0003281575 'closest to 1
+
+
+# Ordinary kriging, with new_data object - MPA boundary
+
+kriging.Simpson <- autoKrige(Simpson~1, 
+                            input_data=points_UoG, 
+                            new_data=measures.grid.2,
+                            remove_duplicates = TRUE,
+                            model = c("Exp", "Gau", "Sph", "Ste"),
+                            verbose = TRUE,
+                            GLS.model = TRUE)
+
+summary(kriging.Simpson)
+(kriging.Simpson)$sser ## sum of squares 0.0003281575
+class(kriging.Simpson$krige_output)
+
+auto.Simpson.output <- (kriging.Simpson$krige_output[,"var1.pred"])
+summary(auto.Simpson.output)
+
+# Cross Validation 
+simp1 <- kriging.Simpson$var_model
+# 5 fold CV
+simpson.krg.cv <- krige.cv(Simpson~1, points_UoG, simp1, nfold=5)
+summary(simpson.krg.cv)
+# mean error, ideally 0: 
+mean(simpson.krg.cv$residual, na.rm=TRUE) #  
+# MSPE, ideally small
+mean(simpson.krg.cv$residual^2, na.rm=TRUE) 
+# Mean square normalized error, ideally close to 1
+mean(simpson.krg.cv$zscore^2, na.rm=TRUE) 
+# correlation observed and predicted, ideally 1
+var(simpson.krg.cv$observed, simpson.krg.cv$observed - simpson.krg.cv$residual, use = "na.or.complete", na.rm=TRUE) 
+# correlation predicted and residual, ideally 0
+var(simpson.krg.cv$observed - simpson.krg.cv$residual, simpson.krg.cv$residual,use = "na.or.complete", na.rm=TRUE) 
+
+# look at the predction and variance
+par(mfrow=c(1,4))
+
+hist(simpson.krg.cv$var1.pred,nclass=20, col="green4", main="predicted")
+hist(simpson.krg.cv$var1.var, nclass=20, col="salmon", main="variation")
+hist(simpson.krg.cv$observed, nclass=20, col="light blue", main="observed")
+hist(simpson.krg.cv$residual, nclass=20, col="yellow", main="residuals")
+
+##### making a raster from output #####
+library("raster")
+library("akima")
+
+auto.Simpson.output.table <- data.table(as.data.frame(auto.Simpson.output, xy = TRUE))
+setnames(auto.Simpson.output.table, "var1.pred", "Simpson")
+setnames(auto.Simpson.output.table, "x1", "Longitude")
+setnames(auto.Simpson.output.table, "x2", "Latitude")
+attributes(auto.Simpson.output.table)
+
+steps <- 1000
+isu_simp <- with(auto.Simpson.output.table, interp(Longitude, Latitude, Simpson , 
+    xo=seq(min(Longitude), max(Longitude), length = steps),
+    yo=seq(min(Latitude), max(Latitude), length = steps)
+))
+par(mfrow=c(1,1))
+
+auto.Simpson.output.raster <- raster(isu_simp)
+plot(auto.Simpson.output.raster)
+crs(auto.Simpson.output.raster) <- "+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs"
+# Convert to degrees
+auto.Simpson.output.raster <- projectRaster(auto.Simpson.output.raster, crs='+proj=longlat +datum=WGS84') 
+
+# mask of the raster by polygon
+par(mfrow=c(1,1))
+plot(auto.Simpson.output.raster)
+plot(cropped2, add=TRUE)
+auto.Simpson.output.raster
+
+masked.auto.Simpson <- raster::mask(auto.Simpson.output.raster,cropped2, inverse=TRUE) # remove areas on land
+names(masked.auto.Simpson) <- "Simpson"
+
+plot(masked.auto.Simpson)
+plot(cropped2, add=TRUE)
+plot(measures, add=TRUE)
+plot(pt, add=TRUE, pch=19, col="red", cex=0.5)
+
+# save it
+#writeRaster(masked.auto.Simpson,'images/auto.Simpson_krig.tif')
+
+##### Gather up the kriged predictions so far ####
+krig.brick <- brick(masked.auto.algae,masked.auto.mud,masked.auto.pebble,masked.auto.gravel,masked.auto.sand,masked.auto.Simpson)
+
+
+plot(krig.brick)
+```
+
+##Checking extents all match
+```{r Checking extents all match}
+##### Importing all the tif files creating during kriging if you don't want to run all the kriging script. Adjust naming of objects depending on if using the original krigs or the imported files from break point. MPA maps and biodiversity scripts will still need to run 
+#### files from original krig ####
+#masked.auto.algae
+#masked.auto.mud
+#masked.auto.pebble
+#masked.auto.gravel
+#masked.auto.sand
+#masked.auto.Simpson
+
+library(raster)
+algae.import <- raster("Rasters/auto.algae_krig.tif")
+gravel.import <- raster("Rasters/auto.gravel_krig.tif")
+mud.import <- raster("Rasters/auto.mud_krig.tif")
+pebble.import <- raster("Rasters/auto.pebble_krig.tif")
+sand.import <- raster("Rasters/auto.sand_krig.tif")
+simpson.import <- raster("Rasters/auto.Simpson_krig.tif")
+velocity.import <- raster("Rasters/masked.velocity.tif")
+distance.import <- raster("Rasters/masked.distance.tif")
+bathy.import <- raster("Rasters/bathy_masked.tif")
+plot(simpson.import)
+
+#### Importing and cropping all rasters & shapefiles #### 
+ # mean velocity created from SAMS thredds
+v1 <- raster("Rasters/masked.velocity.tif") 
+v1
+par(mfrow=c(1,1))
+par(mar = c(3,3,3,3))
+plot(v1)
+
+# cropping to the MPA extent
+e <- as(extent(-5.45, -4.95, 55.35, 55.58), 'SpatialPolygons')
+crs(e) <- "+proj=longlat +datum=WGS84 +no_defs"
+v <- crop(v1, e) # crop using a spatial polygon box crop
+v
+plot(v)
+crs(v) <- "+init=EPSG:4326" 
+v
+
+
+# mask of the velocity raster by polygon
+plot(v)
+plot(cropped2, add=TRUE)
+v
+
+masked.velocity <- mask(v,cropped2, inverse=TRUE) # remove areas on land
+masked.velocity <- mask(masked.velocity,measures) # remove areas outside MPA
+masked.velocity
+plot(masked.velocity)
+plot(cropped2, add=TRUE)
+plot(measures, add=TRUE)
+plot(pt, add=TRUE, pch=19, col="red", cex=0.5)
+
+##### matching the outputs from all substrates to the correct extent/origin ####
+bathy.import # details of the bathy
+velocity.import # details of the velocity
+algae.import # details of the algae krig
+mud.import # details of the mud krig
+pebble.import # details of the pebble krig
+gravel.import # details of the gravel krig
+sand.import # details of the sand krig
+simpson.import # details of the Simpson krig
+distance.import # details og distance to shore
+
+#### matching up to bathy - velocity ####
+origin(bathy.import) # check if these match
+origin (velocity.import) # nope
+extent(bathy.import) # check if the extent matches
+extent(velocity.import) # nope
+
+## resample the algae layer to match the depth layer 
+r.new = resample(masked.velocity, masked.bathy)
+r.new # new rez
+masked.bathy# original
+masked.velocity#original
+plot(r.new)
+crs(r.new) <- "+init=EPSG:4326" 
+
+ex = extent(masked.bathy)
+masked.velocity = crop(r.new, ex)
+
+origin(bathy.import) # check if these match
+origin (velocity.import) # nope
+extent(bathy.import) # check if the extent matches
+extent(velocity.import) # yes
+velocity_proj <- projectRaster(velocity.import, crs = "+init=epsg:32630")
+
+#writeRaster(velocity_proj,"images/masked.velocity.tif", overwrite=TRUE)
+
+#### matching up to bathy - algae ####
+origin(bathy.import) # check if these match
+origin (algae.import) # nope
+extent(bathy.import) # check if the extent matches
+extent(algae.import) # nope
+
+## resample the algae layer to match the depth layer 
+r.new = resample(algae.import, bathy.import)
+r.new # new rez
+bathy.import# original
+algae.import#original
+plot(r.new)
+crs(r.new) <- "+init=EPSG:4326" 
+
+ex = extent(bathy.import)
+algae.import = crop(r.new, ex)
+
+origin(bathy.import) # check if these match
+origin (algae.import) #yes
+extent(bathy.import) # check if the extent matches
+extent(algae.import) # yes
+
+#writeRaster(masked.auto.algae,'images/masked_algae.tif')
+
+#### matching up to bathy - mud ####
+origin(bathy.import) # check if these match
+origin (mud.import) # nope
+extent(bathy.import) # check if the extent matches
+extent(mud.import) # nope
+
+## resample the mud layer to match the depth layer 
+r.new = resample(mud.import, bathy.import)
+r.new # new rez
+masked.bathy# original
+mud.import#original
+plot(r.new)
+crs(r.new) <- "+init=EPSG:4326" 
+
+ex = extent(bathy.import)
+mud.import = crop(r.new, ex)
+
+origin(bathy.import) # check if these match
+origin (mud.import) # yes
+extent(bathy.import) # check if the extent matches
+extent(mud.import) # yes
+
+#writeRaster(masked.auto.mud,'images/masked_mud.tif')
+
+#### matching up to bathy - Pebble ####
+origin(bathy.import) # check if these match
+origin (pebble.import) # nope
+extent(bathy.import) # check if the extent matches
+extent(pebble.import) # nope
+
+## resample the mud layer to match the depth layer 
+r.new = resample(pebble.import, bathy.import)
+r.new # new rez
+bathy.import# original
+pebble.import#original
+plot(r.new)
+crs(r.new) <- "+init=EPSG:4326" 
+
+ex = extent(bathy.import)
+pebble.import = crop(r.new, ex)
+
+origin(bathy.import) # check if these match
+origin (pebble.import) # yes
+extent(bathy.import) # check if the extent matches
+extent(pebble.import) # yes
+
+#writeRaster(masked.auto.pebble,'images/masked_pebble.tif')
+
+#### matching up to bathy - Gravel ####
+origin(bathy.import) # check if these match
+origin (gravel.import) # nope
+extent(bathy.import) # check if the extent matches
+extent(gravel.import) # nope
+
+## resample the mud layer to match the depth layer 
+r.new = resample(gravel.import, bathy.import)
+r.new # new rez
+bathy.import# original
+gravel.import#original
+plot(r.new)
+crs(r.new) <- "+init=EPSG:4326" 
+
+ex = extent(bathy.import)
+gravel.import = crop(r.new, ex)
+
+origin(bathy.import) # check if these match
+origin (gravel.import) # yes
+extent(bathy.import) # check if the extent matches
+extent(gravel.import) # yes
+
+#writeRaster(masked.auto.gravel,'images/masked_gravel.tif')
+
+#### matching up to bathy - Sand ####
+origin(bathy.import) # check if these match
+origin (sand.import) # nope
+extent(bathy.import) # check if the extent matches
+extent(sand.import) # nope
+
+## resample the mud layer to match the depth layer 
+r.new = resample(sand.import, bathy.import)
+r.new # new rez
+bathy.import# original
+sand.import#original
+plot(r.new)
+crs(r.new) <- "+init=EPSG:4326" 
+
+ex = extent(bathy.import)
+sand.import = crop(r.new, ex)
+
+origin(bathy.import) # check if these match
+origin (sand.import) # yes
+extent(bathy.import) # check if the extent matches
+extent(sand.import) # yes
+
+#writeRaster(masked.auto.sand,'images/masked_sand.tif')
+
+#### matching up to bathy - Simpson ####
+origin(bathy.import) # check if these match
+origin (simpson.import) # nope
+extent(bathy.import) # check if the extent matches
+extent(simpson.import) # nope
+
+## resample the mud layer to match the depth layer 
+r.new = resample(simpson.import, bathy.import)
+r.new # new rez
+bathy.import# original
+simpson.import#original
+plot(r.new)
+crs(r.new) <- "+init=EPSG:4326" 
+
+ex = extent(bathy.import)
+simpson.import = crop(r.new, ex)
+
+origin(bathy.import) # check if these match
+origin (simpson.import) # yes
+extent(bathy.import) # check if the extent matches
+extent(simpson.import) # yes
+#writeRaster(masked.auto.Simpson,'images/masked_simpson.tif')
+
+
+#####  doing the slope and aspect etc #####
+slope <- terrain(bathy.import, opt="slope", unit="radians", neighbors=8)
+plot(slope)
+TRI <- terrain(bathy.import, opt="TRI", neighbors=8)
+plot(TRI)
+roughness <- terrain(bathy.import, opt="roughness", neighbors=8)
+plot(roughness)
+flowdir <- terrain(bathy.import, opt="flowdir", neighbors=8)
+plot(flowdir)
+aspect <- terrain(bathy.import, opt="aspect", unit="radians", neighbors=8)
+plot(aspect)
+
+## pretty up the names
+library(data.table)
+summary(bathy.import)
+names(bathy.import) <- "Bathymetry"
+names(velocity.import) <- "Velocity"
+names(distance.import) <- "Distance to shore"
+
+###### build a rasterbrick from all the layers #####
+b1 <-
+  brick(
+  bathy.import,
+  velocity.import,
+  slope,
+  aspect,
+  TRI,
+  roughness,
+  flowdir,
+  algae.import,
+  mud.import,
+  pebble.import,
+  gravel.import,
+  sand.import,
+  simpson.import,
+  distance.import,
+  quick = TRUE
+  )
+  plot(b1)
+  
+  
+env.brick <-
+  brick(bathy.import,
+  masked.velocity,
+  slope,
+  aspect,
+  TRI,
+  roughness,
+  flowdir,
+  distance.import,
+  quick = TRUE)
+  
+plot(env.brick)
+
+all_brick <- brick(
+  bathy.import,
+  simpson.import,
+  masked.velocity,
+  algae.import,
+  mud.import,
+  pebble.import,
+  gravel.import,
+  sand.import,
+  slope,
+  aspect,
+  TRI,
+  roughness,
+  flowdir,
+  distance.import,
+  quick = TRUE)
+plot(all_brick) 
+```
+
+# Gridding samples
+```{r gridding layers and landscape metrics}
+##### Making a grid over the diversity layer #####
+
+
+### projected to get metres
+
+measures.proj <- spTransform(measures, CRS("+init=epsg:32630"))
+# Project Raster
+simpson.import.proj <- projectRaster(simpson.import, crs = "+init=epsg:32630")
+simpson.import.proj
+plot(simpson.import.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+algae.import.proj <- projectRaster(algae.import, crs = "+init=epsg:32630")
+algae.import.proj
+plot(algae.import.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+mud.import.proj <- projectRaster(mud.import, crs = "+init=epsg:32630")
+mud.import.proj
+plot(mud.import.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+sand.import.proj <- projectRaster(sand.import, crs = "+init=epsg:32630")
+sand.import.proj
+plot(sand.import.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+gravel.import.proj <- projectRaster(gravel.import, crs = "+init=epsg:32630")
+gravel.import.proj
+plot(gravel.import.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+pebble.import.proj <- projectRaster(pebble.import, crs = "+init=epsg:32630")
+pebble.import.proj
+plot(pebble.import.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+velocity.import.proj <- projectRaster(velocity.import, crs = "+init=epsg:32630")
+velocity.import.proj
+plot(velocity.import.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+distance.import.proj <- projectRaster(distance.import, crs = "+init=epsg:32630")
+distance.import.proj
+plot(distance.import.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+bathy.import.proj <- projectRaster(bathy.import, crs = "+init=epsg:32630")
+bathy.import.proj
+plot(bathy.import.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+slope.proj <- projectRaster(slope, crs = "+init=epsg:32630")
+slope.proj
+plot(slope.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+aspect.proj <- projectRaster(aspect, crs = "+init=epsg:32630")
+aspect.proj
+plot(aspect.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+TRI.proj <- projectRaster(TRI, crs = "+init=epsg:32630")
+TRI.proj
+plot(TRI.proj)
+plot(measures.proj, add=TRUE)
+
+# Project Raster
+flowdir.proj <- projectRaster(flowdir, crs = "+init=epsg:32630")
+flowdir.proj
+plot(flowdir.proj)
+plot(measures.proj, add=TRUE)
+
+
+library(rgeos)
+library(data.table)
+# playig around
+res(simpson.import.proj)
+extent(simpson.import.proj)
+
+## make a grid 
+grdpts <- makegrid(measures.proj, cellsize=500)
+spgrd <- SpatialPoints(grdpts, proj4string = CRS(proj4string(measures.proj)))
+spgrdWithin <- SpatialPixels(spgrd[measures.proj,])
+class(spgrdWithin)
+spgrdWithin <- as(spgrdWithin, "SpatialPolygons")
+grid.area <- spgrdWithin@polygons[[1]]@area
+plot(simpson.import.proj)
+plot(spgrdWithin, add=TRUE)
+
+## try to extract from raster under the polygon
+div.sample <- raster::extract(x=simpson.import.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+algae.sample <- raster::extract(x=algae.import.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+mud.sample <- raster::extract(x=mud.import.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+sand.sample <- raster::extract(x=sand.import.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+gravel.sample <- raster::extract(x=gravel.import.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+pebble.sample <- raster::extract(x=pebble.import.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+velocity.sample <- raster::extract(x=velocity.import.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+distance.sample <- raster::extract(x=distance.import.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+bathy.sample <- raster::extract(x=bathy.import.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+slope.sample <- raster::extract(x=slope.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+aspect.sample <- raster::extract(x=aspect.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+TRI.sample <- raster::extract(x=TRI.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+flowdir.sample <- raster::extract(x=flowdir.proj, y=spgrdWithin, fun=mean, na.rm=TRUE,df=TRUE)
+
+dim(div.sample)
+spatial.div <- st_as_sf(spgrdWithin)
+spatial.div$ID <- seq.int(nrow(spatial.div))
+spatial.div <- merge(x=spatial.div, y=div.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=algae.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=mud.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=sand.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=gravel.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=pebble.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=velocity.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=distance.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=bathy.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=slope.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=aspect.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=TRI.sample, "ID")
+spatial.div <- merge(x=spatial.div, y=flowdir.sample, "ID")
+
+#check projections % make an sf object in case its better
+measures.2 <- st_as_sf(measures)
+measures.2.prj <- st_transform(measures.2, crs = st_crs(simpson.import.proj))
+
+#make a buffer of 0 to line them up
+spatial.div2 <- sf::st_buffer(spatial.div, dist = 0)
+measures.2.prj <- sf::st_buffer(measures.2.prj, dist = 0)
+
+# which grid square is each point in?
+spatial.div3 <- st_join(x=spatial.div2, y=measures.2.prj, join=st_intersects)
+spatial.div3$AreaM2[spatial.div3$AreaM2>0] <- 250000 # area of each grid cell
+range(spatial.div3$AreaM2)
+names(spatial.div3)
+setnames(spatial.div3, "auto.Simpson_krig", "Mean.Simpson")
+setnames(spatial.div3, "auto.algae_krig", "Mean.Algae")
+setnames(spatial.div3, "auto.mud_krig", "Mean.Mud")
+setnames(spatial.div3, "auto.sand_krig", "Mean.Sand")
+setnames(spatial.div3, "auto.gravel_krig", "Mean.Gravel")
+setnames(spatial.div3, "auto.pebble_krig", "Mean.Pebble")
+
+class(spatial.div3)
+levels(spatial.div3$Limits)
+spatial.div3$Limits <- as.factor(spatial.div3$Limits)
+str(spatial.div3)
+# Renaming factor levels dplyr
+spatial.div3$Limits <- recode_factor(spatial.div3$Limits, "All fishing" ="NTZ", 
+                                "Beam Trawling" = "BT",
+                                "Demersal trawl & dredge" = "TND",
+                                "Demersal trawl dredge & cree" ="DTDC",
+                                "Demersal trawl dredge & creel" ="DTDC")
+class(spatial.div3$AreaM2)
+spatial.div3$AreaM2 <- as.numeric(spatial.div3$AreaM2)
+
+library(dplyr)
+spatial.div3$div.diff <- ave(spatial.div3$Mean.Simpson, spatial.div3$Limits, FUN=function(x)c(diff(x), NA))
+spatial.div3$algae.diff <- ave(spatial.div3$Mean.Algae, spatial.div3$Limits, FUN=function(x)c(diff(x), NA))
+
+
+ggplot(spatial.div3, aes(x=Limits, y=algae.diff)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_continuous(limits = c(-0.1, 0.1)) +
+ggtitle("Mean algae difference by fishing limitation measures")
+
+library(viridis)
+library(ggspatial)
+dev.off()
+grid.div.map <- ggplot() +
+  geom_sf() +
+  xlab("Longitude") + ylab("Latitude") +
+  geom_sf(data=spatial.div3, aes(fill=Mean.Simpson)) +
+  scale_fill_continuous(type="viridis", name="Simpson's\ndiversity \nIndex") +
+  geom_sf(data=Arran) +
+  geom_sf(data=measures2, colour="#D55E00", size=1, fill=NA)+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(4.3, "in"),
+                         style = north_arrow_fancy_orienteering) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+  #     axis.title.y=element_blank(),
+    #   axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+grid.div.map
+
+
+
+# find out the diversity per m2 of eah grid cell
+spatial.div3$divM2 <- spatial.div3$Mean.Simpson/spatial.div3$AreaM2
+spatial.div3$divKM <- spatial.div3$divM2*1000
+head(spatial.div3)
+view
+## The NTZ grid covers so little area 
+require(Hmisc)
+fishing <- c("NTZ")
+fishing.mud<- c("BT")
+Spatial.div4 <- subset(spatial.div3, !(Limits %in% fishing))
+Spatial.div5 <- subset(Spatial.div4, !(Limits %in% fishing.mud))
+levels(Spatial.div4$Limits)
+
+#install.packages("EnvStats")
+library(EnvStats)
+div.plot <- ggplot(spatial.div3, aes(x=Limits, y=Mean.Simpson, fill=Limits)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot() +
+ # geom_jitter(position = position_jitter(0.2), colour="darkgray", alpha=0.3)+
+  stat_n_text() +
+  stat_summary(fun=mean, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  scale_fill_grey()+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+       axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5)) +
+ggtitle("Simpson's diversity")
+div.plot 
+
+ggplot(Spatial.div4, aes(x=Limits, y=divKM)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot() +
+  
+ggtitle("Mean Simpson's diversity per Km by fishing limitation measures")
+
+algae.plot <- ggplot(spatial.div3, aes(x=Limits, y=Mean.Algae, fill=Limits)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot(outlier.shape = NA) +
+#  geom_jitter(position = position_jitter(0.2), colour="darkgray", alpha=0.5)+
+  scale_y_continuous(limits = c(0, 0.6)) +
+  stat_summary(fun=mean, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  stat_n_text(y.pos = 0) + 
+  scale_fill_grey()+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) +
+ggtitle("Algae")
+algae.plot
+
+sand.plot <- ggplot(spatial.div3, aes(x=Limits, y=Mean.Sand, fill=Limits)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot(outlier.shape = NA) + 
+ # geom_jitter(position = position_jitter(0.2), colour="darkgray", alpha=0.5)+
+  scale_y_continuous(limits = c(-0.01, 0.5)) +
+  stat_summary(fun=mean, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  stat_n_text(y.pos = -0.01) +
+  scale_fill_grey()+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) +
+ggtitle("Sand")
+sand.plot
+
+pebble.plot <- ggplot(spatial.div3, aes(x=Limits, y=Mean.Pebble, fill=Limits)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot(outlier.shape = NA) + 
+ # geom_jitter(position = position_jitter(0.2), colour="darkgray", alpha=0.5)+
+  stat_summary(fun=mean, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  stat_n_text(y.pos = 0.025) +
+  scale_y_continuous(limits = c(0.025, 0.125)) +
+  scale_fill_grey()+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) +
+ggtitle("Pebble")
+pebble.plot
+
+gravel.plot <- ggplot(spatial.div3, aes(x=Limits, y=Mean.Gravel, fill=Limits)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot(outlier.shape = NA) + 
+#  geom_jitter(position = position_jitter(0.2), colour="darkgray", alpha=0.5)+
+  stat_n_text(y.pos = 0.09) +
+  scale_y_continuous(limits = c(0.09, 0.35)) +
+  stat_summary(fun=mean, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  scale_fill_grey()+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) +
+ggtitle("Gravel")
+gravel.plot
+
+mud.plot <- ggplot(spatial.div3, aes(x=Limits, y=Mean.Mud, fill=Limits)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot(outlier.shape = NA) + 
+#  geom_jitter(position = position_jitter(0.2), colour="darkgray", alpha=0.5)+
+  stat_summary(fun=mean, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  stat_n_text() +
+  scale_fill_grey()+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) +
+ggtitle("Mud")
+mud.plot
+
+library(ggpubr)
+# Create a figure by combining the different plots
+grid.results<- ggarrange(div.plot,algae.plot,sand.plot,pebble.plot,gravel.plot,mud.plot,ncol = 3, nrow = 2)
+# Annotate the figure by adding a common labels
+annotate_figure(grid.results,
+                bottom = text_grob("Fishing limitations zone", color = "black"))
+
+
+
+```
+
+#Creating clumps
+```{r Landscape metrics}
+
+library(SDMTools)
+library(maptools)
+library(dplyr)
+
+#dev.off()
+substrate_multi <- stack("Rasters/Multiband_substrate.tif") # package requires multiband raster of substrates already created from the rasters exported earlier
+substrate_multi
+names(substrate_multi)
+plot(substrate_multi)
+plot(substrate_multi[[5]]) # just checking
+#plot(sub_stars)
+names(substrate_multi) <- c("Algae", "Gravel", "Mud" , "Pebble", "Sand")
+
+#check projections % make an sf object in case its better
+measures.2 <- st_as_sf(measures)
+measures.2.prj <- st_transform(measures.2, crs = st_crs(simpson.import.proj))
+plot(measures.2.prj)
+
+measures.2.prj$ID <- seq.int(nrow(measures.2.prj))
+# Renaming factor levels dplyr
+measures.2.prj$Limits <- recode_factor(measures.2.prj$Limits, "All fishing" ="NTZ", 
+                                "Beam Trawling" = "BT",
+                                "Demersal trawl & dredge" = "TND",
+                                "Demersal trawl dredge & cree" ="DTDC",
+                                "Demersal trawl dredge & creel" ="DTDC")
+
+
+substrate_multi.proj <- projectRaster(substrate_multi, crs = "+init=epsg:32630")
+plot(substrate_multi.proj[[5]])
+plot(measures.2.prj, add=TRUE)
+names(substrate_multi.proj)
+
+### another version using SDMTools ####
+
+substrate.agg <- aggregate(substrate_multi.proj, fact=4)
+substrate.agg <- substrate.agg*100
+
+plot(substrate.agg)
+substrate.agg2 <- calc(substrate.agg, fun=function(x){ x[x < 20] <- 0; return(x)} )
+# create presence/absence 
+substrate.agg3 <- calc(substrate.agg2, fun=function(x){ x[x > 0] <- 1; return(x)} )
+
+plot(substrate.agg2)
+plot(substrate.agg3)
+
+## trying with the diversity map
+
+diversity.agg <- aggregate(simpson.import.proj, fact=5)
+
+summary(diversity.agg)
+plot(simpson.import.proj)
+plot(diversity.agg)
+diversity.agg2 <- calc(diversity.agg, fun=function(x){ x[x < 4.04] <- 0; return(x)} )
+# create presence/absence 
+diversity.agg3 <- calc(diversity.agg2, fun=function(x){ x[x > 0] <- 1; return(x)} )
+
+plot(diversity.agg2)
+plot(diversity.agg3)
+
+plot(cropped)
+div.patches.map <- diversity.agg3
+plot(div.patches.map)
+div.test.clump <- clump(div.patches.map)
+crs(div.test.clump) <- CRS(the_crs)
+class(div.test.clump)
+poly.div.test.clump <- rasterToPolygons(div.test.clump, dissolve=T)
+plot(poly.div.test.clump)
+poly.div.test.clump <- st_as_sf(poly.div.test.clump)
+class(poly.div.test.clump$clumps)
+
+### making some  outputs #####
+
+### algae ###
+plot(cropped)
+algae.patches.map <- (substrate.agg3)[[1]]
+plot(algae.patches.map)
+algae.clump1 <- clump(algae.patches.map)
+crs(algae.clump1) <- CRS(the_crs)
+class(algae.clump1)
+poly.algae.clump1 <- rasterToPolygons(algae.clump1, dissolve=T)
+plot(poly.algae.clump1)
+poly.algae.clump1 <- st_as_sf(poly.algae.clump1)
+class(poly.algae.clump1$clumps)
+
+
+algae.patches.spdf <- as(algae.clump1, "SpatialPixelsDataFrame")
+algae.patches.df <- as.data.frame(algae.patches.spdf)
+names(algae.patches.df)
+colnames(algae.patches.df) <- c("Algae.patches", "Longitude", "Latitude")
+summary(algae.patches.df)
+class(algae.patches.df$Algae.patches)
+algae.patches.df$Algae.patches <- as.factor(algae.patches.df$Algae.patches)
+
+library(ggspatial)
+#install.packages("ggthemes")
+library(ggthemes)
+cropped
+cropped <- st_transform(cropped, the_crs)
+plot(algae.clump1)
+plot(cropped, add=TRUE)
+plot(measures.2.prj, add=TRUE)
+compareCRS(algae.clump1, cropped)
+compareCRS(algae.clump1, measures.proj)
+algae.clump1
+
+algae.patche.map <- ggplot() +
+  geom_sf(data=cropped)+
+  geom_sf(data=measures.2.prj, fill=NA, size=1)+
+  ggtitle("Algae")+
+  geom_raster(data=algae.patches.df, aes(x=Longitude, y=Latitude, fill=Algae.patches)) +
+  scale_fill_viridis_d(option = "B", direction = -1) +
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
+                         style = north_arrow_fancy_orienteering) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+                legend.position = "none",
+        axis.title.x=element_blank(), 
+        axis.title.y=element_blank())
+algae.patche.map
+
+#### Gravel ####
+
+gravel.patches <- (substrate.agg3)[[2]]
+plot(gravel.patches)
+gravel.clump1 <- clump(gravel.patches)
+crs(gravel.clump1) <- CRS(the_crs)
+class(gravel.clump1)
+gravel.patches.spdf <- as(gravel.clump1, "SpatialPixelsDataFrame")
+gravel.patches.df <- as.data.frame(gravel.patches.spdf)
+names(gravel.patches.df)
+colnames(gravel.patches.df) <- c("Gravel.patches", "Longitude", "Latitude")
+summary(gravel.patches.df)
+plot(gravel.patches.df)
+class(gravel.patches.df$Gravel.patches)
+gravel.patches.df$Gravel.patches <- as.factor(gravel.patches.df$Gravel.patches)
+
+
+gravel.patches.map <- ggplot() +
+  geom_sf() +
+  ggtitle("Gravel")+
+  geom_raster(data=gravel.patches.df, aes(x=Longitude, y=Latitude, fill=Gravel.patches), alpha=0.8) +
+     scale_fill_viridis_d(option = "B", direction = -1) +
+    geom_sf(data=measures.2.prj, fill=NA, size=1)+
+    geom_sf(data=cropped)+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
+                         style = north_arrow_fancy_orienteering) +
+     theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+                legend.position = "none",
+        axis.title.x=element_blank(), 
+        axis.title.y=element_blank())
+gravel.patches.map 
+
+
+gravel.patches <- (substrate.agg3)[[2]]
+plot(gravel.patches)
+gravel.clump1 <- clump(gravel.patches)
+crs(gravel.clump1) <- CRS(the_crs)
+class(gravel.clump1)
+gravel.patches.spdf <- as(gravel.clump1, "SpatialPixelsDataFrame")
+gravel.patches.df <- as.data.frame(gravel.patches.spdf)
+names(gravel.patches.df)
+colnames(gravel.patches.df) <- c("Gravel.patches", "Longitude", "Latitude")
+summary(gravel.patches.df)
+plot(gravel.patches.df)
+class(gravel.patches.df$Gravel.patches)
+gravel.patches.df$Gravel.patches <- as.factor(gravel.patches.df$Gravel.patches)
+
+
+gravel.patches.map <- ggplot() +
+  geom_sf() +
+  ggtitle("Gravel")+
+  geom_raster(data=gravel.patches.df, aes(x=Longitude, y=Latitude, fill=Gravel.patches), alpha=0.8) +
+     scale_fill_viridis_d(option = "B", direction = -1) +
+    geom_sf(data=measures.2.prj, fill=NA, size=1)+
+    geom_sf(data=cropped)+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
+                         style = north_arrow_fancy_orienteering) +
+     theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+                legend.position = "none",
+        axis.title.x=element_blank(), 
+        axis.title.y=element_blank())
+gravel.patches.map
+
+#### Mud ####
+mud.patches <- (substrate.agg3)[[3]]
+plot(mud.patches)
+mud.clump1 <- clump(mud.patches)
+crs(mud.clump1) <- CRS(the_crs)
+class(mud.clump1)
+mud.patches.spdf <- as(mud.clump1, "SpatialPixelsDataFrame")
+mud.patches.df <- as.data.frame(mud.patches.spdf)
+names(mud.patches.df)
+colnames(mud.patches.df) <- c("Mud.patches", "Longitude", "Latitude")
+summary(mud.patches.df)
+plot(mud.patches.df)
+class(mud.patches.df$Mud.patches)
+mud.patches.df$Mud.patches <- as.factor(mud.patches.df$Mud.patches)
+
+
+mud.patches.map <- ggplot() +
+  geom_sf() +
+  ggtitle("Mud")+
+  geom_raster(data=mud.patches.df, aes(x=Longitude, y=Latitude, fill=Mud.patches), alpha=0.8) +
+     scale_fill_viridis_d(option = "B", direction = -1) +
+    geom_sf(data=measures.2.prj, fill=NA, size=1)+
+    geom_sf(data=cropped)+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
+                         style = north_arrow_fancy_orienteering) +
+     theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+                legend.position = "none",
+        axis.title.x=element_blank(), 
+        axis.title.y=element_blank())
+mud.patches.map
+
+#### pebble ####
+pebble.patches <- (substrate.agg3)[[4]]
+pebble.clump1 <- clump(pebble.patches)
+crs(pebble.clump1) <- CRS(the_crs)
+class(pebble.clump1)
+pebble.patches.spdf <- as(pebble.clump1, "SpatialPixelsDataFrame")
+pebble.patches.df <- as.data.frame(pebble.patches.spdf)
+names(pebble.patches.df)
+colnames(pebble.patches.df) <- c("Pebble.patches", "Longitude", "Latitude")
+summary(pebble.patches.df)
+class(pebble.patches.df$Pebble.patches)
+pebble.patches.df$Pebble.patches <- as.factor(pebble.patches.df$Pebble.patches)
+
+
+pebble.patches.map <- ggplot() +
+  geom_sf() +
+  ggtitle("Pebble")+
+  geom_raster(data=pebble.patches.df, aes(x=Longitude, y=Latitude, fill=Pebble.patches), alpha=0.8) +
+     scale_fill_viridis_d(option = "B", direction = -1) +
+    geom_sf(data=measures.2.prj, fill=NA, size=1)+
+    geom_sf(data=cropped)+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
+                         style = north_arrow_fancy_orienteering) +
+     theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+                legend.position = "none",
+        axis.title.x=element_blank(), 
+        axis.title.y=element_blank())
+pebble.patches.map
+
+#### sand ####
+sand.patches <- (substrate.agg3)[[5]]
+sand.clump1 <- clump(sand.patches)
+crs(sand.clump1) <- CRS(the_crs)
+class(sand.clump1)
+sand.patches.spdf <- as(sand.clump1, "SpatialPixelsDataFrame")
+sand.patches.df <- as.data.frame(sand.patches.spdf)
+names(sand.patches.df)
+colnames(sand.patches.df) <- c("Sand.patches", "Longitude", "Latitude")
+summary(sand.patches.df)
+class(sand.patches.df$Sand.patches)
+sand.patches.df$Sand.patches <- as.factor(sand.patches.df$Sand.patches)
+
+
+sand.patches.map <- ggplot() +
+  geom_sf() +
+  ggtitle("Sand")+
+  geom_raster(data=sand.patches.df, aes(x=Longitude, y=Latitude, fill=Sand.patches), alpha=0.8) +
+     scale_fill_viridis_d(option = "B", direction = -1) +
+    geom_sf(data=measures.2.prj, fill=NA, size=1)+
+    geom_sf(data=cropped)+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
+                         style = north_arrow_fancy_orienteering) +
+     theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+                legend.position = "none",
+        axis.title.x=element_blank(), 
+        axis.title.y=element_blank())
+sand.patches.map
+
+#### diversity ####
+
+div.patches <- diversity.agg3
+div.clump1 <- clump(div.patches)
+crs(div.clump1) <- CRS(the_crs)
+class(div.clump1)
+div.patches.spdf <- as(div.clump1, "SpatialPixelsDataFrame")
+div.patches.df <- as.data.frame(div.patches.spdf)
+names(div.patches.df)
+colnames(div.patches.df) <- c("Div.patches", "Longitude", "Latitude")
+summary(div.patches.df)
+class(div.patches.df$Div.patches)
+div.patches.df$Div.patches <- as.factor(div.patches.df$Div.patches)
+summary(div.patches.df)
+
+div.patches.map <- ggplot() +
+  geom_sf() +
+  ggtitle("Diversity")+
+  geom_tile(data=div.patches.df, aes(x=Longitude, y=Latitude, fill=Div.patches), alpha=0.8) +
+     scale_fill_viridis_d(option = "B", direction = -1) +
+    geom_sf(data=measures.2.prj, fill=NA, size=1)+
+    geom_sf(data=cropped)+
+     theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+                legend.position = "none",
+        axis.title.x=element_blank(), 
+        axis.title.y=element_blank())
+div.patches.map
+
+
+
+library(ggpubr)
+# Create a figure by combining the different plots
+patch.clumps<- ggarrange(algae.patche.map,gravel.patches.map,mud.patches.map,pebble.patches.map,sand.patches.map,div.patches.map,ncol = 3, nrow = 2)
+# Annotate the figure by adding a common labels
+annotate_figure(patch.clumps,
+                top = text_grob("Identifyed substrate patches", color = "black", face = "bold", size = 14),
+                left = text_grob("Latitude", color = "black", rot=90),
+                bottom = text_grob("Longitude", color = "black"))
+
+```
+
+## Diversity Indices
+```{r Species diversity indices}
+#install.packages("rdiversity")
+library(rdiversity)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+
+metadata.2020 <- read.csv("All_years_meta.csv")
+summary(metadata.2020)
+names(metadata.2020)
+
+
+dat <- read.csv("Allyears_SBRUV_species.csv") %>%
+  tibble::column_to_rownames("Species")
+
+meta <- metacommunity(dat)
+res <- norm_sub_alpha(meta, 0:10)
+
+species_richness <- res %>% filter(q == 0)
+shannon_diversity <- res %>% filter(q == 1)
+simpson_diversity <- res %>% filter(q == 2)
+
+# Subcommunity alpha diversity vs metacommunity alpha diversity
+ggplot() + theme_minimal() +
+  geom_line(aes(x = q, y = diversity,
+                            group = partition_name,
+                            colour = partition_name), res, colour = "grey",
+                     alpha = 0.5) +
+geom_line(aes(x = q, y = diversity,
+                group = partition_name,
+                colour = partition_name), norm_meta_alpha(meta, 0:10),
+          colour = "red")
+
+# Calculate subcommunity representativeness at q = 1
+representativeness <- norm_sub_rho(meta, 1) %>%
+  arrange(desc(diversity))
+
+representativeness %>%
+  tibble::rowid_to_column("index") %>%
+  ggplot() + theme_minimal() +
+  geom_line(aes(x = index, y = diversity)) +
+  labs(x = "Subcommunity", y = "Representativeness")
+
+# Look at the biological diversity of the most and least representative
+# subcommunities
+
+res %>%
+  dplyr::mutate(what = dplyr::case_when(
+    partition_name %in% head(representativeness$partition_name, 10) ~
+      "most representative",
+    partition_name %in% tail(representativeness$partition_name, 10) ~
+      "least representative",
+    T ~ "other")) %>%
+  dplyr::filter(what != "other") %>%
+  ggplot() + theme_minimal() + facet_wrap(~what) +
+  geom_line(aes(x = q, y = diversity,
+                group = partition_name,
+                colour = partition_name)) +
+  expand_limits(y=0) +
+  labs(y = "Normalised alpha diversity")
+
+# Compare the biological diversity of the least representative subcommunities
+# to everything else
+
+tmp <- res %>%
+  mutate(what = dplyr::case_when(
+    partition_name %in% tail(representativeness$partition_name, 10) ~
+      "least representative",
+    T ~ "other"))
+ggplot() + theme_minimal() +
+  geom_line(aes(x = q, y = diversity, group = partition_name,
+                colour = what), subset(tmp, what == "other"), colour = "grey",
+            alpha = 0.5) +
+  geom_line(aes(x = q, y = diversity, group = partition_name,
+                colour = what), subset(tmp, what != "other"),
+            colour = "red")
+
+shannon <- dplyr::select(shannon_diversity, partition_name, diversity)
+# unable to use pipe since apparently raster package is clashing with this :(
+
+names(shannon)
+names(shannon)[1] <- "Station"
+names(shannon)[2] <- "Shannon"
+
+metadata.2020 <- merge(x=metadata.2020, y=shannon, "Station")
+
+simpson <- dplyr::select(simpson_diversity, partition_name, diversity)
+
+names(simpson)
+names(simpson)[1] <- "Station"
+names(simpson)[2] <- "Simpson"
+
+metadata.2020 <- merge(x=metadata.2020, y=simpson, "Station")
+head(metadata.2020)
+```
+
+#Dist patch edge
+```{r sites details}
+# Look at SBRUV points and calculate distance to patch edges
+# Assign each SBRUV point to a substrate patch ID
+##### algae #####
+sites.algae <- subset(Sites.UoG,Habitat%in%c("Algae"))
+names(sites.algae)
+xy <- sites.algae[,c(6,5)]
+
+
+algae.sites.pt <- SpatialPointsDataFrame(coords = xy, data = sites.algae,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+algae.proj <- spTransform(algae.sites.pt, CRS("+init=epsg:32630")) # projecting
+
+
+# load in the shapefile for shoreline
+algae.patches.map <- (substrate.agg3)[[1]]
+plot(algae.patches.map)
+algae.clump1 <- clump(algae.patches.map)
+crs(algae.clump1) <- CRS(the_crs)
+poly.algae.clump1 <- rasterToPolygons(algae.clump1, dissolve=T)
+plot(poly.algae.clump1)
+
+# if you need an sf 
+poly.algae.sf <- st_as_sf(poly.algae.clump1)
+poly.algae.sf2 = st_transform(poly.algae.sf, 32630)
+plot(poly.algae.sf2)
+algae.proj
+
+# ## need to make the polygon lat long for geosphere to work
+# now that you have the correct epsg set, reproject to 4326
+poly.algae.latlong = st_transform(select(poly.algae.sf2,geometry), 4326)
+poly.algae.latlong
+algae.latlong <- as(poly.algae.latlong, "Spatial")
+
+st_crs(poly.algae.latlong) == st_crs(algae.sites.pt)
+plot(poly.algae.latlong)
+plot(algae.sites.pt, add=TRUE)
+
+
+##### calculate distance to edge of patch ####
+library(geosphere)
+# compute the shortest distance between points and polygons
+# (from ?dist2Line): "returns matrix with distance and lon/lat of the nearest point" & 
+# "the ID (index) of (one of) the nearest objects"; distance is in meters (default)
+dist.algae <- geosphere::dist2Line(p = algae.sites.pt, line = algae.latlong)
+dist.algae
+# bind results with original points
+algae.sites.p2dist <- cbind(algae.sites.pt, dist.algae)
+algae.sites.p2dist
+algae.sites.p2dist.sf <- st_as_sf(algae.sites.p2dist)
+names(algae.sites.p2dist.sf)
+setnames(algae.sites.p2dist.sf, "distance", "dist.edge.patch")
+setnames(algae.sites.p2dist.sf, "ID.1", "patchID")
+algae.sites.p2dist.sf$patchID <- as.character(algae.sites.p2dist.sf$patchID)
+algae.sites.p2dist.sf$patchID <- sub("^", "Algae", algae.sites.p2dist.sf$patchID )
+
+algae.details <- algae.sites.p2dist.sf
+algae.details$patchID <-as.factor(algae.details$patchID)
+head(algae.details)
+class(algae.details)
+
+library(forcats)
+# look at simpson per patch
+algae.patch.box <- ggplot(algae.details, aes(x=reorder(patchID, Simpson, FUN= median), y=Simpson, fill=patchID)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot() +
+  scale_fill_grey() +
+  geom_point(position=position_jitterdodge(dodge.width = 0.75),aes(group=patchID, alpha=0.1))+
+  stat_n_text() +
+  theme_bw() +
+  ylab("Simpsons Diversity Index")+
+  ggtitle("Algae")+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) 
+algae.patch.box 
+
+
+##### mud ####
+
+sites.mud <- subset(Sites.UoG,Habitat%in%c("Mud"))
+names(sites.mud)
+xy <- sites.mud[,c(6,5)]
+
+mud.sites.pt <- SpatialPointsDataFrame(coords = xy, data = sites.mud,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+mud.proj <- spTransform(mud.sites.pt, CRS("+init=epsg:32630")) # projecting
+
+
+# load in the shapefile for shoreline
+mud.patches.map <- (substrate.agg3)[[3]]
+plot(mud.patches.map)
+mud.clump1 <- clump(mud.patches.map)
+crs(mud.clump1) <- CRS(the_crs)
+poly.mud.clump1 <- rasterToPolygons(mud.clump1, dissolve=T)
+plot(poly.mud.clump1)
+
+# if you need an sf 
+poly.mud.sf <- st_as_sf(poly.mud.clump1)
+poly.mud.sf2 = st_transform(poly.mud.sf, 32630)
+plot(poly.mud.sf2)
+mud.proj
+
+# ## need to make the polygon lat long for geosphere to work
+# now that you have the correct epsg set, reproject to 4326
+poly.mud.latlong = st_transform(select(poly.mud.sf2,geometry), 4326)
+poly.mud.latlong
+mud.latlong <- as(poly.mud.latlong, "Spatial")
+
+st_crs(poly.mud.latlong) == st_crs(mud.sites.pt)
+plot(poly.mud.latlong)
+plot(mud.sites.pt, add=TRUE)
+
+library(geosphere)
+# compute the shortest distance between points and polygons
+# (from ?dist2Line): "returns matrix with distance and lon/lat of the nearest point" & 
+# "the ID (index) of (one of) the nearest objects"; distance is in meters (default)
+dist.mud <- geosphere::dist2Line(p = mud.sites.pt, line = mud.latlong)
+dist.mud
+# bind results with original points
+mud.sites.p2dist <- cbind(mud.sites.pt, dist.mud)
+mud.sites.p2dist
+mud.sites.p2dist.sf <- st_as_sf(mud.sites.p2dist)
+names(mud.sites.p2dist.sf)
+setnames(mud.sites.p2dist.sf, "distance", "dist.edge.patch")
+setnames(mud.sites.p2dist.sf, "ID.1", "patchID")
+mud.sites.p2dist.sf$patchID <- as.character(mud.sites.p2dist.sf$patchID)
+mud.sites.p2dist.sf$patchID <- sub("^", "Mud", mud.sites.p2dist.sf$patchID )
+
+mud.details <- mud.sites.p2dist.sf
+mud.details$patchID <-as.factor(mud.details$patchID)
+head(mud.details)
+
+mud.patch.box <- ggplot(mud.details, aes(x=reorder(patchID, Simpson, FUN= median), y=Simpson, fill=patchID)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot() +
+  scale_fill_grey() +
+  geom_point(position=position_jitterdodge(dodge.width = 0.75),aes(group=patchID, alpha=0.1))+
+  stat_n_text() +
+  theme_bw() +
+  ylab("Simpsons Diversity Index")+
+  ggtitle("Mud")+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) 
+mud.patch.box 
+
+#### sand ####
+sites.sand <- subset(Sites.UoG,Habitat%in%c("Sand"))
+names(sites.sand)
+xy <- sites.sand[,c(6,5)]
+
+
+sand.sites.pt <- SpatialPointsDataFrame(coords = xy, data = sites.sand,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+sand.proj <- spTransform(sand.sites.pt, CRS("+init=epsg:32630")) # projecting
+
+
+# load in the shapefile for shoreline
+sand.patches.map <- (substrate.agg3)[[5]]
+plot(sand.patches.map)
+sand.clump1 <- clump(sand.patches.map)
+crs(sand.clump1) <- CRS(the_crs)
+poly.sand.clump1 <- rasterToPolygons(sand.clump1, dissolve=T)
+plot(poly.sand.clump1)
+
+# if you need an sf 
+poly.sand.sf <- st_as_sf(poly.sand.clump1)
+poly.sand.sf2 = st_transform(poly.sand.sf, 32630)
+plot(poly.sand.sf2)
+sand.proj
+
+# ## need to make the polygon lat long for geosphere to work
+# now that you have the correct epsg set, reproject to 4326
+poly.sand.latlong = st_transform(select(poly.sand.sf2,geometry), 4326)
+poly.sand.latlong
+sand.latlong <- as(poly.sand.latlong, "Spatial")
+
+st_crs(poly.sand.latlong) == st_crs(sand.sites.pt)
+plot(poly.sand.latlong)
+plot(sand.sites.pt, add=TRUE)
+
+library(geosphere)
+# compute the shortest distance between points and polygons
+# (from ?dist2Line): "returns matrix with distance and lon/lat of the nearest point" & 
+# "the ID (index) of (one of) the nearest objects"; distance is in meters (default)
+dist.sand <- geosphere::dist2Line(p = sand.sites.pt, line = sand.latlong)
+dist.sand
+# bind results with original points
+sand.sites.p2dist <- cbind(sand.sites.pt, dist.sand)
+sand.sites.p2dist
+sand.sites.p2dist.sf <- st_as_sf(sand.sites.p2dist)
+names(sand.sites.p2dist.sf)
+setnames(sand.sites.p2dist.sf, "distance", "dist.edge.patch")
+setnames(sand.sites.p2dist.sf, "ID.1", "patchID")
+sand.sites.p2dist.sf$patchID <- as.character(sand.sites.p2dist.sf$patchID)
+sand.sites.p2dist.sf$patchID <- sub("^", "Sand", sand.sites.p2dist.sf$patchID )
+
+sand.details <- sand.sites.p2dist.sf
+sand.details$patchID <-as.factor(sand.details$patchID)
+head(sand.details)
+
+### some data exploration ####
+sand.patch.box <- ggplot(sand.details, aes(x=reorder(patchID, Simpson, FUN= median), y=Simpson, fill=patchID)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot() +
+  scale_fill_grey() +
+  geom_point(position=position_jitterdodge(dodge.width = 0.75),aes(group=patchID, alpha=0.1))+
+  stat_n_text() +
+  theme_bw() +
+  ylab("Simpsons Diversity Index")+
+  ggtitle("Sand")+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) 
+sand.patch.box 
+
+
+#### gravel ####
+sites.gravel <- subset(Sites.UoG,Habitat%in%c("Gravel"))
+names(sites.gravel)
+xy <- sites.gravel[,c(6,5)]
+
+gravel.sites.pt <- SpatialPointsDataFrame(coords = xy, data = sites.gravel,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+gravel.proj <- spTransform(gravel.sites.pt, CRS("+init=epsg:32630")) # projecting
+
+
+# load in the shapefile for shoreline
+gravel.patches.map <- (substrate.agg3)[[2]]
+plot(gravel.patches.map)
+gravel.clump1 <- clump(gravel.patches.map)
+crs(gravel.clump1) <- CRS(the_crs)
+poly.gravel.clump1 <- rasterToPolygons(gravel.clump1, dissolve=T)
+plot(poly.gravel.clump1)
+
+# if you need an sf 
+poly.gravel.sf <- st_as_sf(poly.gravel.clump1)
+poly.gravel.sf2 = st_transform(poly.gravel.sf, 32630)
+plot(poly.gravel.sf2)
+gravel.proj
+
+# ## need to make the polygon lat long for geosphere to work
+# now that you have the correct epsg set, reproject to 4326
+poly.gravel.latlong = st_transform(select(poly.gravel.sf2,geometry), 4326)
+poly.gravel.latlong
+gravel.latlong <- as(poly.gravel.latlong, "Spatial")
+
+st_crs(poly.gravel.latlong) == st_crs(gravel.sites.pt)
+plot(poly.gravel.latlong)
+plot(gravel.sites.pt, add=TRUE)
+
+library(geosphere)
+# compute the shortest distance between points and polygons
+# (from ?dist2Line): "returns matrix with distance and lon/lat of the nearest point" & 
+# "the ID (index) of (one of) the nearest objects"; distance is in meters (default)
+dist.gravel <- geosphere::dist2Line(p = gravel.sites.pt, line = gravel.latlong)
+dist.gravel
+# bind results with original points
+gravel.sites.p2dist <- cbind(gravel.sites.pt, dist.gravel)
+gravel.sites.p2dist
+gravel.sites.p2dist.sf <- st_as_sf(gravel.sites.p2dist)
+names(gravel.sites.p2dist.sf)
+setnames(gravel.sites.p2dist.sf, "distance", "dist.edge.patch")
+setnames(gravel.sites.p2dist.sf, "ID.1", "patchID")
+gravel.sites.p2dist.sf$patchID <- as.character(gravel.sites.p2dist.sf$patchID)
+gravel.sites.p2dist.sf$patchID <- sub("^", "Gravel", gravel.sites.p2dist.sf$patchID )
+
+gravel.details <- gravel.sites.p2dist.sf
+gravel.details$patchID <-as.factor(gravel.details$patchID)
+head(gravel.details)
+
+gravel.patch.box <- ggplot(gravel.details, aes(x=reorder(patchID, Simpson, FUN= median), y=Simpson, fill=patchID)) +
+  stat_boxplot(geom ='errorbar') +
+  geom_boxplot() +
+  scale_fill_grey() +
+  geom_point(position=position_jitterdodge(dodge.width = 0.75),aes(group=patchID, alpha=0.1))+
+  stat_n_text() +
+  theme_bw() +
+  ylab("Simpsons Diversity Index")+
+  ggtitle("Gravel")+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) 
+gravel.patch.box 
+
+#### pebble ####
+sites.pebble <- subset(Sites.UoG,Habitat%in%c("Pebble"))
+names(sites.pebble)
+xy <- sites.pebble[,c(6,5)]
+
+pebble.sites.pt <- SpatialPointsDataFrame(coords = xy, data = sites.pebble,
+                             proj4string = CRS("+proj=longlat +datum=WGS84"))
+pebble.proj <- spTransform(pebble.sites.pt, CRS("+init=epsg:32630")) # projecting
+
+
+# load in the shapefile for shoreline
+pebble.patches.map <- (substrate.agg3)[[4]]
+plot(pebble.patches.map)
+pebble.clump1 <- clump(pebble.patches.map)
+crs(pebble.clump1) <- CRS(the_crs)
+poly.pebble.clump1 <- rasterToPolygons(pebble.clump1, dissolve=T)
+plot(poly.pebble.clump1)
+
+# if you need an sf 
+poly.pebble.sf <- st_as_sf(poly.pebble.clump1)
+poly.pebble.sf2 = st_transform(poly.pebble.sf, 32630)
+plot(poly.pebble.sf2)
+pebble.proj
+
+# ## need to make the polygon lat long for geosphere to work
+# now that you have the correct epsg set, reproject to 4326
+poly.pebble.latlong = st_transform(select(poly.pebble.sf2,geometry), 4326)
+poly.pebble.latlong
+pebble.latlong <- as(poly.pebble.latlong, "Spatial")
+
+st_crs(poly.pebble.latlong) == st_crs(pebble.sites.pt)
+plot(poly.pebble.latlong)
+plot(pebble.sites.pt, add=TRUE)
+
+library(geosphere)
+# compute the shortest distance between points and polygons
+# (from ?dist2Line): "returns matrix with distance and lon/lat of the nearest point" & 
+# "the ID (index) of (one of) the nearest objects"; distance is in meters (default)
+dist.pebble <- geosphere::dist2Line(p = pebble.sites.pt, line = pebble.latlong)
+dist.pebble
+# bind results with original points
+pebble.sites.p2dist <- cbind(pebble.sites.pt, dist.pebble)
+pebble.sites.p2dist
+pebble.sites.p2dist.sf <- st_as_sf(pebble.sites.p2dist)
+names(pebble.sites.p2dist.sf)
+setnames(pebble.sites.p2dist.sf, "distance", "dist.edge.patch")
+setnames(pebble.sites.p2dist.sf, "ID.1", "patchID")
+pebble.sites.p2dist.sf$patchID <- as.character(pebble.sites.p2dist.sf$patchID)
+pebble.sites.p2dist.sf$patchID <- sub("^", "Pebble", pebble.sites.p2dist.sf$patchID )
+
+pebble.details <- pebble.sites.p2dist.sf
+pebble.details$patchID <-as.factor(pebble.details$patchID)
+head(pebble.details)
+
+```
+
+##Old/new patches
+```{r maps of old and new}
+## overlay original maps with the new predictions
+original.kelp <- sf::st_read(dsn = "Shapefiles/2013_original_map/map parts - kelp.shp") %>% st_transform(32630)
+
+original.sand <- sf::st_read(dsn = "Shapefiles/2013_original_map/map parts - sand.shp") %>% st_transform(32630)
+
+original.grael.maerl <- sf::st_read(dsn = "Shapefiles/2013_original_map/map parts -grave-maerl.shp") %>% st_transform(32630)
+
+original.maerlbeds <- sf::st_read(dsn = "Shapefiles/2013_original_map/Map part - maerl beds.shp") %>% st_transform(32630)
+
+original.seagrass <- sf::st_read(dsn = "Shapefiles/2013_original_map/map part- seagrass.shp") %>% st_transform(32630)
+
+original.mud <- sf::st_read(dsn = "Shapefiles/2013_original_map/burrowed mud.shp") %>% st_transform(32630)
+
+simpson.raster.spdf <- as(simpson.import, "SpatialPixelsDataFrame")
+simpson.raster.df <- as.data.frame(simpson.raster.spdf)
+colnames(simpson.raster.df) <- c("Simpson.Krig", "Longitude", "Latitude")
+summary(simpson.raster.df)
+
+plot(simpson.import.proj)
+plot(original.kelp, add=TRUE)
+plot(original.sand, add=TRUE)
+plot(original.grael.maerl, add=TRUE)
+plot(original.maerlbeds, add=TRUE)
+plot(original.seagrass, add=TRUE)
+plot(measures.proj, add=TRUE)
+
+simpson.map.2013snh <- ggplot() +
+  geom_sf() +
+  geom_sf(data=Arran) +
+  geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig ), alpha=0.8) +
+  scale_fill_continuous(type="viridis", name="Predicted\nSimpons\nIndex") +
+  geom_sf(data=original.kelp, fill = "#0c863d") + 
+  geom_sf(data=original.mud, fill = "#beb297") +
+  geom_sf(data=original.sand, fill = "#eaa00e") + 
+  geom_sf(data=original.grael.maerl, fill = "#de0fc6") +
+  geom_sf(data=original.maerlbeds, fill = "#f7afb1") +
+  geom_sf(data=original.seagrass, fill = "#19e52a") +
+  geom_sf(data=measures2, fill=NA, colour="#D55E00", size=1)+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.8, "in"),
+                        style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+simpson.map.2013snh
+
+## zoom into the areas of increased biodiversity
+
+simpson.2013.zoom1 <- ggplot() +
+  geom_sf() +
+  geom_sf(data=Arran) +
+ geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig), alpha=0.8) +
+  scale_fill_continuous(type="viridis", name="Predicted\nSimpons\nIndex") +
+  geom_sf(data=original.kelp, fill = "#0c863d") + 
+  geom_sf(data=original.mud, fill = "#beb297") +
+  geom_sf(data=original.sand, fill = "#eaa00e") + 
+  geom_sf(data=original.grael.maerl, fill = "#de0fc6") +
+ geom_sf(data=original.maerlbeds, fill = "#f7afb1") +
+  geom_sf(data=original.seagrass, fill = "#19e52a") +
+  geom_sf(data=measures2, fill=NA, colour="#D55E00", size=1)+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+    coord_sf(xlim = c(-5.11, -5.04), ylim = c(55.47, 55.52), expand = FALSE) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+simpson.2013.zoom1
+
+## our predictions
+predicted.algae <- sf::st_read(dsn = "Shapefiles/Connectivity/algae/algae_patch_connectivity.shp") %>% st_transform(32630)
+
+predicted.gravel <- sf::st_read(dsn = "Shapefiles/Connectivity/gravel/gravel_patch_connectivity.shp") %>% st_transform(32630)
+
+predicted.mud <- sf::st_read(dsn = "Shapefiles/Connectivity/mud/mud_patch_connectivity.shp") %>% st_transform(32630)
+
+predicted.pebble <- sf::st_read(dsn = "Shapefiles/Connectivity/pebble/pebble_patch_connectivity.shp") %>% st_transform(32630)
+
+predicted.sand <- sf::st_read(dsn = "Shapefiles/Connectivity/sand/sand_patch_connectivity.shp") %>% st_transform(32630)
+
+predcit.plot.sand <- ggplot() +
+  geom_sf() +
+  geom_sf(data=Arran) +
+  geom_sf(data=predicted.sand, fill = "#b7484b") + 
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+predcit.plot.sand
+
+spimpsons.only <- ggplot() +
+  geom_sf() +
+  geom_sf(data=Arran) +
+   geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig), alpha=0.8) +
+  scale_fill_continuous(type="viridis", name="Predicted\nSimpons\nIndex") +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+spimpsons.only
+
+mpa.only <- ggplot() +
+   geom_sf(data=measures2, fill=NA, colour="#D55E00", size=1)+
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+mpa.only
+
+# all predicted substrates with simpson diversity
+Simons.plot.now <- ggplot() +
+  geom_sf() +
+  geom_sf(data=Arran) +
+   geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig), alpha=0.8) +
+  scale_fill_continuous(type="viridis", name="Predicted\nSimpons\nIndex") +
+    geom_sf(data=predicted.algae, fill = "#229150", alpha=0.5) + 
+  geom_sf(data=predicted.sand, fill = "#e5b636", alpha=0.5) + 
+  geom_sf(data=predicted.gravel, fill = "#e8718d", alpha=0.5) +
+  geom_sf(data=predicted.pebble, fill = "#b7484b", alpha=0.7) +
+  geom_sf(data=predicted.mud, fill = "#91522d", alpha=0.2) +
+  geom_sf(data=measures2, fill=NA, colour="#D55E00", size=1)+
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+Simons.plot.now
+
+# zoomed in section of the areas with the highest biodiversity
+zoom.1.plot <- ggplot() +
+  geom_sf() +
+  geom_sf(data=Arran) +
+  geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig), alpha=0.8) +
+ scale_fill_continuous(type="viridis", name="Predicted\nSimpons\nIndex") +
+  geom_sf(data=predicted.mud, fill = "burlywood4", alpha=0.3) +
+ geom_sf(data=predicted.sand, fill = "moccasin", alpha=0.3) +
+  geom_sf(data=predicted.algae, fill = "forestgreen", alpha=0.3) +
+ geom_sf(data=predicted.gravel, fill = "lightpink2", alpha=0.3) +
+  geom_sf(data=predicted.pebble, fill = "maroon", alpha=0.3) +
+  geom_sf(data=measures2, fill=NA, colour="#D55E00", size=1)+
+  coord_sf(xlim = c(-5.11, -5.04), ylim = c(55.47, 55.52), expand = FALSE) +
+  annotation_scale(location = "bl", width_hint = 0.5)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+zoom.1.plot
+
+zoom.2.plot <- ggplot() +
+  geom_sf() +
+  geom_sf(data=Arran) +
+ geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig), alpha=0.8) +
+ scale_fill_continuous(type="viridis", name="Predicted\nSimpons\nIndex") +
+ geom_sf(data=predicted.mud, fill = "burlywood4", alpha=0.3 ) +
+ geom_sf(data=predicted.sand, fill = "moccasin", alpha=0.3) +
+ geom_sf(data=predicted.algae, fill = "forestgreen", alpha=0.3) +
+geom_sf(data=predicted.gravel, fill = "lightpink2", alpha=0.3) +
+ geom_sf(data=predicted.pebble, fill = "maroon", alpha=0.3) +
+  geom_sf(data=measures2, fill=NA, colour="#D55E00", size=1)+
+  coord_sf(xlim = c(-5.15, -5.08), ylim = c(55.40, 55.45), expand = FALSE) +
+  annotation_scale(location = "bl", width_hint = 0.5)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+zoom.2.plot
+
+zoom.3.plot <- ggplot() +
+  geom_sf() +
+  geom_sf(data=Arran) +
+  geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig), alpha=0.8) +
+ scale_fill_continuous(type="viridis", name="Predicted\nSimpons\nIndex") +
+ geom_sf(data=predicted.mud, fill = "burlywood4", alpha=0.3) +
+ geom_sf(data=predicted.sand, fill = "moccasin", alpha=0.3) +
+ geom_sf(data=predicted.algae, fill = "forestgreen", alpha=0.3) +
+geom_sf(data=predicted.gravel, fill = "lightpink2", alpha=0.3) +
+geom_sf(data=predicted.pebble, fill = "maroon", alpha=0.3) +
+geom_sf(data=measures2, fill=NA, colour="#D55E00", size=1)+
+  coord_sf(xlim = c(-5.32, -5.24), ylim = c(55.40, 55.45), expand = FALSE) +
+  annotation_scale(location = "bl", width_hint = 0.5)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+zoom.3.plot
+
+zoom.4.plot <- ggplot() +
+  geom_sf() +
+  geom_sf(data=Arran) +
+  geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig), alpha=0.8) +
+ scale_fill_continuous(type="viridis", name="Predicted\nSimpons\nIndex") +
+ geom_sf(data=predicted.mud, fill = "burlywood4", alpha=0.3) +
+ geom_sf(data=predicted.sand, fill = "moccasin", alpha=0.3) +
+ geom_sf(data=predicted.algae, fill = "forestgreen", alpha=0.3) +
+geom_sf(data=predicted.gravel, fill = "lightpink2", alpha=0.3) +
+ geom_sf(data=predicted.pebble, fill = "maroon", alpha=0.3) +
+  geom_sf(data=measures2, fill=NA, colour="#D55E00", size=1)+
+  coord_sf(xlim = c(-5.4, -5.3), ylim = c(55.47, 55.53), expand = FALSE) +
+  annotation_scale(location = "bl", width_hint = 0.5)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+zoom.4.plot
+
+# put together with the whole map as blown up section
+```
+
+## Visualisations
+```{r looking into the data}
+
+# both PA points from data
+
+substrate.df<- as.data.frame(substrate.landscape)
+algae.substrate.df <- substrate.df
+algae.substrate.df$PA <- ifelse(substrate.df$Algae>0,1,0)
+algae.substrate.df$PA <- as.factor(algae.substrate.df$PA)
+
+mud.substrate.df <- substrate.df
+mud.substrate.df$PA <- ifelse(mud.substrate.df$Mud>0,1,0)
+mud.substrate.df$PA <- as.factor(mud.substrate.df$PA)
+
+pebble.substrate.df <- substrate.df
+pebble.substrate.df$PA <- ifelse(pebble.substrate.df$Pebble>0,1,0)
+pebble.substrate.df$PA <- as.factor(pebble.substrate.df$PA)
+
+gravel.substrate.df <- substrate.df
+gravel.substrate.df$PA <- ifelse(gravel.substrate.df$Gravel>0,1,0)
+gravel.substrate.df$PA <- as.factor(gravel.substrate.df$PA)
+
+sand.substrate.df <- substrate.df
+sand.substrate.df$PA <- ifelse(sand.substrate.df$Sand>0,1,0)
+sand.substrate.df$PA <- as.factor(sand.substrate.df$PA)
+
+##### make plots of prediction with real points ####
+cropped2
+UoG_sf
+
+### Algae point raster plot 
+# make a df of the raster to plotin ggplot
+algae.import
+area.raster.spdf <- as(algae.import, "SpatialPixelsDataFrame")
+area.raster.df <- as.data.frame(area.raster.spdf)
+summary(area.raster.df)
+range(area.raster.df$Algae)
+names(area.raster.df)
+colnames(area.raster.df) <- c("Algae.Krig", "Longitude", "Latitude")
+algae.substrate.df$PA <- as.factor(algae.substrate.df$PA)
+
+library(ggspatial)
+
+# map with predicted Algae and real points
+summary(algae.import)
+
+
+algae.test.map<- ggplot()+
+  geom_raster(data = as.data.frame(algae.import, xy = TRUE), aes(x, y, fill = auto.algae_krig), show.legend = TRUE)+
+  scale_fill_continuous(type="viridis", na.value = "white", name="Proportional\ncoverage") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  geom_sf(data=Arran)+
+  ggtitle("Algae")+
+  geom_point(mapping = aes(x = Longitude, y = Latitude, col=PA), size=1, data = algae.substrate.df, position = "identity", show.legend = FALSE) +
+  scale_color_manual(values = c("0" = "black", "1" = "white"))+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                         style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+algae.test.map
+
+
+##### Mud point raster plot ####
+# make a df of the raster to plotin ggplot
+mud.raster.spdf <- as(mud.import, "SpatialPixelsDataFrame")
+mud.raster.df <- as.data.frame(mud.raster.spdf)
+summary(mud.raster.df)
+range(mud.raster.df$Mud)
+names(mud.raster.df)
+colnames(mud.raster.df) <- c("Mud.Krig", "Longitude", "Latitude")
+mud.substrate.df$PA <- as.factor(mud.substrate.df$PA)
+# map with predicted mud and real points
+summary(mud.import)
+
+
+mud.test.map<- ggplot()+
+  
+  geom_raster(data = as.data.frame(mud.import, xy = TRUE), aes(x, y, fill = auto.mud_krig))+
+  scale_fill_continuous(type="viridis", na.value = "white", name="Proportional\ncoverage") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  geom_sf(data=Arran)+
+  ggtitle("Mud")+
+  geom_point(mapping = aes(x = Longitude, y = Latitude, col=PA), size=1, data = mud.substrate.df, position = "identity", show.legend = FALSE) +
+  scale_color_manual(values = c("0" = "black", "1" = "white"))+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                         style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+mud.test.map
+
+
+##### Pebble point raster plot ####
+# make a df of the raster to plotin ggplot
+pebble.raster.spdf <- as(pebble.import, "SpatialPixelsDataFrame")
+pebble.raster.df <- as.data.frame(pebble.raster.spdf)
+summary(pebble.raster.df)
+range(pebble.raster.df$Pebble)
+names(pebble.raster.df)
+colnames(pebble.raster.df) <- c("Pebble.Krig", "Longitude", "Latitude")
+pebble.substrate.df$PA <- as.factor(pebble.substrate.df$PA)
+# map with predicted pebble and real points
+summary(pebble.import)
+
+peb.test.map<- ggplot()+
+  
+  geom_raster(data = as.data.frame(pebble.import, xy = TRUE), aes(x, y, fill = auto.pebble_krig))+
+  scale_fill_continuous(type="viridis", na.value = "white", name="Proportional\ncoverage") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  geom_sf(data=Arran)+
+  ggtitle("Pebble")+
+  geom_point(mapping = aes(x = Longitude, y = Latitude, col=PA), size=1, data = pebble.substrate.df, position = "identity", show.legend = FALSE) +
+  scale_color_manual(values = c("0" = "black", "1" = "white"))+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                         style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+    theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+peb.test.map
+
+##### Gravel point raster plot ####
+# make a df of the raster to plotin ggplot
+gravel.raster.spdf <- as(gravel.import, "SpatialPixelsDataFrame")
+gravel.raster.df <- as.data.frame(gravel.raster.spdf)
+summary(gravel.raster.df)
+range(gravel.raster.df$Gravel)
+names(gravel.raster.df)
+colnames(gravel.raster.df) <- c("Gravel.Krig", "Longitude", "Latitude")
+gravel.substrate.df$PA <- as.factor(gravel.substrate.df$PA)
+# map with predicted gravel and real points
+summary(gravel.import)
+
+gravel.test.map<- ggplot()+
+  
+  geom_raster(data = as.data.frame(gravel.import, xy = TRUE), aes(x, y, fill = auto.gravel_krig))+
+  scale_fill_continuous(type="viridis", na.value = "white", name="Proportional\ncoverage") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  geom_sf(data=Arran)+
+  ggtitle("Gravel")+
+  geom_point(mapping = aes(x = Longitude, y = Latitude, col=PA), size=1, data = gravel.substrate.df, position = "identity", show.legend = FALSE) +
+  scale_color_manual(values = c("0" = "black", "1" = "white"))+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                         style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+gravel.test.map
+
+##### Sand point raster plot ####
+# make a df of the raster to plotin ggplot
+sand.raster.spdf <- as(sand.import, "SpatialPixelsDataFrame")
+sand.raster.df <- as.data.frame(sand.raster.spdf)
+summary(sand.raster.df)
+range(sand.raster.df$Sand)
+names(sand.raster.df)
+colnames(sand.raster.df) <- c("Sand.Krig", "Longitude", "Latitude")
+sand.substrate.df$PA <- as.factor(sand.substrate.df$PA)
+# map with predicted sand and real points
+summary(sand.import)
+
+sand.test.map<- ggplot()+
+  
+  geom_raster(data = as.data.frame(sand.import, xy = TRUE), aes(x, y, fill = auto.sand_krig))+
+  scale_fill_continuous(type="viridis", na.value = "white", name="Proportional\ncoverage") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  geom_sf(data=Arran)+
+  ggtitle("Sand")+
+  geom_point(mapping = aes(x = Longitude, y = Latitude, col=PA), size=1, data = sand.substrate.df, position = "identity", show.legend = FALSE) +
+  scale_color_manual(values = c("0" = "black", "1" = "white"))+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                         style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+sand.test.map
+
+## ##### Simpsons point raster plot ####
+# make a df of the raster to plotin ggplot
+simpson.raster.spdf <- as(simpson.import, "SpatialPixelsDataFrame")
+simpson.raster.df <- as.data.frame(simpson.raster.spdf)
+summary(simpson.raster.df)
+mean(simpson.raster.df$auto.Simpson_krig[simpson.raster.df$auto.Simpson_krig>=quantile(simpson.raster.df$auto.Simpson_krig, 0.8, na.rm=TRUE)], na.rm=TRUE) # top 10% values 4.04
+# upper 3rd qunatil == 3.789
+# make a vector of boundary to plot over the raster for one of the plots
+
+library(dplyr) 
+#upper3rd <- simpson.raster.df %>%
+ # filter(auto.Simpson_krig >= 3.789) %>%
+#  select(auto.Simpson_krig, x, y)
+
+#upper3rd
+#colnames(upper3rd) <- c("Simpson.Krig", "Longitude", "Latitude")
+#poly.upper.div <- rasterToPolygons(, dissolve=T)
+
+names(simpson.raster.df)
+colnames(simpson.raster.df) <- c("Simpson.Krig", "Longitude", "Latitude")
+
+# map with predicted sand and real points
+simpson.map<- ggplot()+
+  geom_sf(data=Arran)+
+  geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig)) +
+  scale_fill_continuous(type="viridis", name="Predicted\nIndex") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  ggtitle("Simpson's Diversity Index")+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                        style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+simpson.map
+
+# map of upper diversity quantile
+upper_div<- ggplot()+
+  geom_sf(data=Arran)+
+  geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig)) +
+  scale_fill_continuous(type="viridis", name="Predicted\nIndex") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  ggtitle("Simpson's Diversity Index")+
+  geom_sf(data=poly.div.test.clump, fill=NA, colour="#000000", size=0.75)+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                        style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+upper_div
+library(ggpubr)
+# Create a figure by combining the different plots
+krig.results<- ggarrange(algae.test.map,mud.test.map,peb.test.map,gravel.test.map,sand.test.map,simpson.map,ncol = 2, nrow = 3)
+# Annotate the figure by adding a common labels
+annotate_figure(krig.results,
+                top = text_grob("Predicted proportional substrate coverage and diversity", color = "black", face = "bold", size = 14),
+                left = text_grob("Latitude", color = "black", rot=90),
+                bottom = text_grob("Longitude", color = "black"))
+
+## ##### Distance to shore point raster plot ####
+# make a df of the raster to plotin ggplot
+distance.import <- distance.import/1000 #convert to kn for maps
+distance.raster.spdf <- as(distance.import, "SpatialPixelsDataFrame")
+distance.raster.df <- as.data.frame(distance.raster.spdf)
+summary(distance.raster.df)
+names(distance.raster.df)
+colnames(distance.raster.df) <- c("Distance", "Longitude", "Latitude")
+
+# map with predicted sand and real points
+summary(distance.import)
+
+
+dist.test.map<- ggplot()+
+  geom_raster(data = as.data.frame(distance.import, xy = TRUE), aes(x, y, fill = Distance.to.shore))+
+  scale_fill_continuous(type="viridis", na.value = "white", name="Distance\nto shore (km)") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  geom_sf(data=Arran)+
+  ggtitle("Distance to shore")+
+   annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                        style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+    theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+dist.test.map
+
+## ##### velocity raster plot ####
+
+origin(bathy.import) # check if these match
+origin (velocity.import) # nope
+extent(bathy.import) # check if the extent matches
+extent(velocity.import) # nope
+
+## resample the mud layer to match the depth layer 
+r.new = resample(velocity.import, bathy.import)
+r.new # new rez
+bathy.import# original
+velocity.import#original
+plot(r.new)
+crs(r.new) <- "+init=EPSG:4326" 
+velocity.import <- raster::mask(velocity.import,measures) # remove areas outside MPA
+plot(velocity.import)
+
+# make a df of the raster 
+velocity.raster.spdf <- as(velocity.import, "SpatialPixelsDataFrame")
+velocity.raster.df <- as.data.frame(velocity.raster.spdf)
+summary(velocity.raster.df)
+names(velocity.raster.df)
+colnames(velocity.raster.df) <- c("Mean.velocity", "Longitude", "Latitude")
+
+summary(velocity.import)
+
+
+vel.test.map<- ggplot()+
+  geom_raster(data = as.data.frame(velocity.import, xy = TRUE), aes(x, y, fill = Velocity))+
+  scale_fill_continuous(type="viridis", na.value = "white", name="Mean\nvelocity (m/s)") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  geom_sf(data=Arran)+
+  ggtitle("Current velocity")+
+   annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                        style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+    theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+vel.test.map
+
+### Depth Map plot ####
+# make a df of the raster to plotin ggplot
+depth.raster.spdf <- as(bathy.import, "SpatialPixelsDataFrame")
+depth.raster.df <- as.data.frame(depth.raster.spdf)
+summary(depth.raster.df)
+names(depth.raster.df)
+colnames(depth.raster.df) <- c("Depth", "Longitude", "Latitude")
+
+# map with predicted bathy and real points
+summary(bathy.import)
+
+
+depth.test.map<- ggplot()+
+  geom_raster(data = as.data.frame(bathy.import, xy = TRUE), aes(x, y, fill = Bathymetry))+
+  scale_fill_continuous(type="viridis", na.value = "white", name="Depth (m)") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  geom_sf(data=Arran)+
+  ggtitle("Depth")+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                        style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+    theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+depth.test.map
+
+### Do TRI map from bathy points raster ####
+TRI <- terrain(bathy.import, opt="TRI", neighbors=8)
+plot(TRI)
+
+# make a df of the raster to plotin ggplot
+TRI.raster.spdf <- as(TRI, "SpatialPixelsDataFrame")
+TRI.raster.df <- as.data.frame(TRI.raster.spdf)
+summary(TRI.raster.df)
+names(TRI.raster.df)
+colnames(TRI.raster.df) <- c("Terrain.Ruggedness.Index", "Longitude", "Latitude")
+
+# map with predicted bathy and real points
+summary(TRI)
+
+
+tri.test.map<- ggplot()+
+  geom_raster(data = as.data.frame(TRI, xy = TRUE), aes(x, y, fill = tri))+
+  scale_fill_continuous(type="viridis", na.value = "white", name="TRI") +
+  geom_sf(data=measures.2, fill=NA, colour="#D55E00", size=1)+
+  geom_sf(data=Arran)+
+  ggtitle("Terrain Ruggedness Index")+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.6, "in"),
+                        style = north_arrow_fancy_orienteering) +
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+tri.test.map
+
+
+library(ggpubr)
+# Create a figure by combining the different plots
+map.results<- ggarrange(dist.test.map,vel.test.map,depth.test.map,tri.test.map, ncol = 2, nrow = 2)
+# Annotate the figure by adding a common labels
+annotate_figure(map.results,
+                top = text_grob("test mapping", color = "black", face = "bold", size = 14),
+                bottom = text_grob("Fishing limitations zone", color = "black"))
+
+  
+##### Survey point maps ##### 
+
+SNh.points <- subset(substrate.landscape, Source %in% c("SNH"))
+class(SNh.points$Year)
+SNh.points$Year <- as.factor(SNh.points$Year)
+
+SNH.map<- ggplot()+
+  geom_sf(data=measures2, aes(fill=(Limits)))+
+  scale_fill_grey() +
+  geom_sf(data=Arran)+
+  geom_point(mapping = aes(x = Longitude, y = Latitude, colour="dark red"), size=1, data = SNh.points, position = "identity", show.legend = FALSE) +
+  ggtitle("DDV sites all years")+
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+SNH.map
+
+UOG.points <- subset(substrate.landscape, Source %in% c("UOG"))
+class(UOG.points$Year)
+UOG.points$Year <- as.factor(UOG.points$Year)
+
+
+UOG.map<- ggplot()+
+  geom_sf(data=measures2, aes(fill=(Limits)), show.legend = FALSE)+
+  scale_fill_grey() +
+  geom_sf(data=Arran)+
+  geom_point(mapping = aes(x = Longitude, y = Latitude, colour="dark red"), size=1, data = UoG_sf.points, position = "identity", show.legend = FALSE) +
+  ggtitle("SBRUV sites all years")+
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE)+
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         pad_x = unit(0.25, "in"), pad_y = unit(5, "in"),
+                        style = north_arrow_fancy_orienteering) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+
+UOG.map
+
+
+# Create a figure by combining the different plots
+DDV.map.results<- ggarrange(UOG.map,SNH.map, ncol = 2, nrow = 1, widths = c(1, 1.14))
+# Annotate the figure by adding a common labels
+annotate_figure(DDV.map.results)
+```
+
+#MPA patch stats
+```{r Group patch stats}
+## look at the Area, perimeter, perimeter to area ratio and FDI for each substrate type
+require(foreach)
+
+patch_statistics <- foreach(i = 1:dim(substrate.agg3)[3],
+        .combine = "rbind") %do%
+  {
+    clumped_matrix <- clump(substrate.agg3[[i]], directions=8)
+    
+    PatchStat(clumped_matrix) %>% 
+      mutate(type = names(substrate.agg3)[i])
+    
+  }
+
+
+Algae.stats <- subset(patch_statistics,type%in%c("Algae"))
+Algae.stats$patchID <- as.character(Algae.stats$patchID)
+Algae.stats$patchID <- sub("^", "Algae", Algae.stats$patchID)
+
+Gravel.stats <- subset(patch_statistics,type%in%c("Gravel"))
+Gravel.stats$patchID <- as.character(Gravel.stats$patchID)
+Gravel.stats$patchID <- sub("^", "Gravel", Gravel.stats$patchID)
+
+Pebble.stats <- subset(patch_statistics,type%in%c("Pebble"))
+Pebble.stats$patchID <- as.character(Pebble.stats$patchID)
+Pebble.stats$patchID <- sub("^", "Pebble", Pebble.stats$patchID)
+
+Mud.stats <- subset(patch_statistics,type%in%c("Mud"))
+Mud.stats$patchID <- as.character(Mud.stats$patchID)
+Mud.stats$patchID <- sub("^", "Mud", Mud.stats$patchID)
+
+Sand.stats <- subset(patch_statistics,type%in%c("Sand"))
+Sand.stats$patchID <- as.character(Sand.stats$patchID)
+Sand.stats$patchID <- sub("^", "Sand", Sand.stats$patchID)
+
+patch_statistics2 <- Algae.stats
+patch_statistics2 <- rbind(patch_statistics2, Gravel.stats, Pebble.stats, Mud.stats, Sand.stats)
+
+patch.data <- algae.details
+patch.data <- rbind(patch.data, pebble.details, gravel.details, sand.details, mud.details)
+sites_patches <- merge(x=patch.data, y=patch_statistics2, "patchID")
+
+# export details to csv
+#write.csv(sites_patches,"metadata_all.csv", row.names = FALSE)
+
+sites_patches %>% 
+  ggplot(aes(type, frac.dim.index))+
+  geom_boxplot(aes(fill = type))+
+  theme_classic(20)+
+  scale_fill_brewer(palette = "Set1")
+
+plot(clumped_matrix)
+names(patch_statistics)
+
+
+frac.plot.patch <- ggboxplot(patch_statistics, x="type", y="frac.dim.index", bxp.errorbar =TRUE, outlier.shape = NA, varwidth=TRUE, fill = "type")+
+  stat_summary(fun.data = mean_se, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  scale_fill_grey() +
+  theme_bw() +
+  stat_n_text(y.pos = 0.98) +
+  scale_y_continuous(limits = c(0.98, 1.42)) +
+      ylab("Fractal dimension index")+
+      theme(panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      legend.position = "none",
+      axis.title.x=element_blank())
+frac.plot.patch
+
+
+area.plot.patch <- ggboxplot(patch_statistics, x="type", y="area", bxp.errorbar =TRUE, outlier.shape = NA, varwidth=TRUE, fill = "type")+
+   stat_summary(fun.data = mean_se, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  stat_n_text() +
+  scale_fill_grey() +
+  theme_bw() +
+  scale_y_log10() +
+      labs(y = bquote("Area" ~ (m^2)))+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) 
+area.plot.patch
+
+
+perimratio.plot.patch <- ggboxplot(patch_statistics, x="type", y="perim.area.ratio", bxp.errorbar =TRUE, outlier.shape = NA, varwidth=TRUE, fill = "type")+
+   stat_summary(fun.data = mean_se, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  stat_n_text() +
+  scale_fill_grey() +
+  theme_bw() +
+  ylab("Perimeter to are ratio")+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) 
+perimratio.plot.patch
+
+perimeter.plot <- ggboxplot(patch_statistics, x="type", y="perimeter", bxp.errorbar =TRUE, outlier.shape = NA, varwidth=TRUE, fill = "type")+
+  stat_summary(fun.data = mean_se, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  stat_n_text() +
+  scale_fill_grey() +
+  theme_bw() +
+  scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x),
+  labels = scales::trans_format("log10", scales::math_format(10^.x)))+
+  ylab("Perimeter (m)")+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) 
+perimeter.plot
+
+### pop it all together ####
+
+library(ggpubr)
+# Create a figure by combining the different plots
+patch.results<- ggarrange(area.plot.patch,perimeter.plot,perimratio.plot.patch,frac.plot.patch,ncol = 2, nrow = 2)
+# Annotate the figure by adding a common labels
+annotate_figure(patch.results,
+                bottom = text_grob("Substratum type", color = "black"))
+
+```
+
+#Individual Patch stats
+```{r raster masks}
+
+require(foreach)
+
+substrate_statistics <- foreach(i = 1:dim(substrate.agg3)[[3]],
+        .combine = "rbind") %do%
+{
+    # make a polygon from each patch in layer
+  print(paste(substrate.agg3@data@names[i]))
+    clumped_matrix <- clump(substrate.agg3[[i]], directions=8)
+    clump.poly <- rasterToPolygons(clumped_matrix, dissolve=T)
+    clump.poly <- st_as_sf(clump.poly)
+    clump.poly$substrate <- substrate.agg3@data@names[i] 
+    
+    # Loop through patch polygons
+    patch_summary <- foreach(j = 1:nrow(clump.poly),
+                             .combine = "rbind") %do%
+      {
+        print(j)
+        feat.poly <- subset(clump.poly, 
+                            clumps == clump.poly$clumps[j])
+        masked.clump <-
+          raster::extract(
+            x = all_brick,
+            y = feat.poly,
+            fun = mean,
+            na.rm = TRUE,
+            df = TRUE
+          )
+        
+        # Mask by feature
+            masked.feat <- raster::mask(substrate.agg3[[i]],
+                                        feat.poly)
+        
+        # Determine if substrate present
+        if(masked.feat@data@max == 0)
+        {
+          # Output NA
+          patch_stats_j <- data.frame(patchID = NA,
+                     n.cell = NA,
+                     n.core.cell = NA,
+                     n.edges.perimeter = NA,
+                     n.edges.internal = NA,
+                     area = NA,
+                     core.area = NA,
+                     perimeter = NA,
+                     perim.area.ratio = NA,
+                     shape.index = NA,
+                     frac.dim.index = NA,
+                     core.area.index = NA,
+                     type = NA)
+        }else
+        {
+          clumped_matrix <- clump(masked.feat, directions=8)
+          
+          patch_stats_j <- PatchStat(clumped_matrix) %>% 
+            mutate(type = names(masked.feat))
+        }
+        
+        masked.clump %>% 
+          mutate(clump = j) %>% 
+          cbind(patch_stats_j)
+      }
+
+    # Attach metadata
+    patch_summary$substrate <- substrate.agg3@data@names[i] 
+    patch_summary
+  }
+
+head(substrate_statistics)
+
+ggplot(substrate_statistics, aes(x=Distance.to.shore, y=auto.Simpson_krig)) +
+  geom_point() + 
+  geom_smooth() +
+    facet_wrap(~substrate)
+
+
+ggplot(substrate_statistics, aes(x=area, y=auto.Simpson_krig)) +
+  geom_point() + 
+  geom_smooth() +
+  facet_wrap(~substrate)
+
+head(substrate_statistics)
+
+diversity.patch <- ggboxplot(substrate_statistics, x="substrate", y="auto.Simpson_krig", bxp.errorbar =TRUE, outlier.shape = NA, varwidth=TRUE, fill = "type")+
+  stat_summary(fun.data = mean_se, geom="point", shape=4, size=4, colour="blue", stroke=1.5, show.legend=FALSE) +
+  stat_n_text() +
+    scale_fill_grey() +
+    theme_bw() +
+      ylab("Simpson's diversity Index")+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank())
+diversity.patch
+
+library(ggpubr)
+# Create a figure by combining the different plots
+patch.results2<- ggarrange(area.plot.patch,diversity.patch,perimratio.plot.patch,frac.plot.patch,ncol = 2, nrow = 2)
+# Annotate the figure by adding a common labels
+annotate_figure(patch.results2,
+                bottom = text_grob("Substratum type", color = "black"))
+
+```
+
+#Summary patch stats
+```{r summary data by fishing restrictions}
+## look at details by fishing restriction areas in MPA
+## NTZ - not take zone
+## BT - no beam trawl
+## TND - no trawl and dredge
+## DTDC - no demersal trawl, dredge and creel
+
+
+patch_stats_by_feature <- foreach(f = 1:length(measures.2.prj$Feature),
+                                  .combine = "rbind") %do%
+  {
+    # Mask by feature
+    feat.poly <- subset(measures.2.prj, Feature == measures.2.prj$Feature[f])
+    masked.feat <- raster::mask(substrate.agg3, feat.poly)
+    
+    # Loop through substrates
+    patch_stats_feature <- foreach(i = 1:dim(masked.feat)[3],
+                                    .combine = "rbind") %do%
+      {
+        # Determine if substrate present
+        if(masked.feat[[i]]@data@max == 0)
+        {
+          # Output NA
+          data.frame(patchID = NA,
+                     n.cell = NA,
+                     n.core.cell = NA,
+                     n.edges.perimeter = NA,
+                     n.edges.internal = NA,
+                     area = NA,
+                     core.area = NA,
+                     perimeter = NA,
+                     perim.area.ratio = NA,
+                     shape.index = NA,
+                     frac.dim.index = NA,
+                     core.area.index = NA,
+                     type = NA)
+        }else
+        {
+          clumped_matrix <- clump(masked.feat[[i]], directions=8)
+          
+          PatchStat(clumped_matrix) %>% 
+            mutate(type = names(masked.feat)[i])
+        }
+      }
+    
+    # Attach feature information
+    patch_stats_feature %>% 
+      mutate(feature = f,
+             limits = measures.2.prj$Limits[f])
+  }
+
+patch_stats_by_feature %>% 
+  na.omit() %>% 
+  ggplot(aes(type, n.cell))+
+  geom_boxplot(aes(fill = type))+
+  theme_classic(20)+
+  scale_fill_brewer(palette = "Set1")+
+  facet_wrap(~limits)+
+  scale_y_log10()
+
+
+ncells.plot.limits <- ggplot(patch_stats_by_feature %>% filter(!is.na(type)), aes(x=type, y=n.cell, fill=type, na.omit=TRUE)) +
+  stat_boxplot(geom ='errorbar') +
+    scale_fill_grey() +
+  scale_y_log10() +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~limits)+
+    theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) +
+ggtitle("Number of cells for each patch m2")
+ncells.plot.limits 
+annotate_figure(ncells.plot.limits,
+                bottom = text_grob("Substratum type", color = "black"))
+
+area.plot.limits <- ggplot(patch_stats_by_feature %>% filter(!is.na(type)), aes(x=type, y=area, fill=type, na.omit=TRUE)) +
+  stat_boxplot(geom ='errorbar') +
+    scale_fill_grey() +
+  scale_y_log10() +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~limits)+
+    theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) +
+ggtitle("Area") 
+area.plot.limits
+
+annotate_figure(area.plot.limits,
+                bottom = text_grob("Substratum type", color = "black"))
+
+peri.plot.limits <- ggplot(patch_stats_by_feature %>% filter(!is.na(type)), aes(x=type, y=perim.area.ratio, fill=type, na.omit=TRUE)) +
+  stat_boxplot(geom ='errorbar') +
+    scale_fill_grey() +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~limits)+
+    theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) +
+ggtitle("Ratio of the patch perimeter(m) to area(m2)") 
+peri.plot.limits
+
+annotate_figure(peri.plot.limits,
+                bottom = text_grob("Substratum type", color = "black"))
+
+frac.plot.limits <- ggplot(patch_stats_by_feature %>% filter(!is.na(type)), aes(x=type, y=frac.dim.index, fill=type, na.omit=TRUE)) +
+  stat_boxplot(geom ='errorbar') +
+    scale_fill_grey() +
+     scale_y_continuous(limits = c(1, 1.5)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~limits)+
+    theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank()) +
+ggtitle("Fractal dimension index") 
+frac.plot.limits
+
+annotate_figure(frac.plot.limits,
+                bottom = text_grob("Substratum type", color = "black"))
+
+patch_stats_by_feature %>% 
+  na.omit() %>% 
+  group_by(limits, type) %>% 
+  summarise(n_patch = max(patchID))
+
+names(patch_stats_by_feature)
+
+```
+
+# Patch differences
+```{r patch differences}
+
+### break point  - loading in compiled metadata of everything calcualated so far or just continue to use the one calculated earlier #####
+#sites_patches original or / 
+sites.patches <- read.csv("full_metadata.csv", header=TRUE, sep=",") # use as appropriate
+names(sites.patches)
+sites.patches$Limits <- as.factor(sites.patches$Limits)
+str(sites.patches)
+# convert stations into an sf object by specifying coordinates and crs
+stations <- st_as_sf(sites.patches, 
+                     coords = c("Longitd", "Latitud"), # note x goes first
+                     crs = 4326, # projection, 
+                     remove = FALSE) # don't remove lat/lon cols from dataframe
+class(measures2)
+plot(stations)
+
+plot(masked.bathy)
+plot(cropped2, add=TRUE)
+plot(measures, add=TRUE)
+plot(stations, add=TRUE, pch=19, col="red", cex=0.5)
+
+#remotes::install_github("r-spatial/mapview")
+library(mapview)
+library(leafem)
+
+st_crs(measures2)==st_crs(stations)
+measures2 = st_transform(measures2, 4326)
+
+library(mapview)
+
+mapview(measures2) + mapview(stations, zcol="Limits") + 
+  mapview(predicted.sand, color = 'red') +
+  mapview(predicted.gravel, color = 'green') 
+
+
+Simons.plot.now <- ggplot() +
+  geom_sf() +
+  geom_sf(data=Arran) +
+   geom_raster(data=simpson.raster.df, aes(x=Longitude, y=Latitude, fill=Simpson.Krig), alpha=0.8) +
+  scale_fill_continuous(type="viridis", name="Predicted\nSimpons\nIndex") +
+    geom_sf(data=predicted.algae, fill = "#229150", alpha=0.5) + 
+  geom_sf(data=predicted.sand, fill = "#e5b636", alpha=0.5) + 
+  geom_sf(data=predicted.gravel, fill = "#e8718d", alpha=0.5) +
+  geom_sf(data=predicted.pebble, fill = "#b7484b", alpha=0.7) +
+  geom_sf(data=predicted.mud, fill = "#91522d", alpha=0.2) +
+  geom_sf(data=measures2, fill=NA, colour="#D55E00", size=1)+
+  coord_sf(xlim = c(-5.45, -4.95), ylim = c(55.35, 55.58), expand = FALSE) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.y=element_blank(),
+        axis.title.x=element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5))
+Simons.plot.now
+
+names(sites_patches)
+
+sites.patches2 <- merge(sites.patches, sites_patches[, c("Station", "patchID")], by = "Station")
+
+names(sites.patches2)
+str(sites.patches2)
+class(sites.patches2$Habitat)
+sites.patches2$Main.Substrate <- as.factor(sites.patches2$Main.Substrate)
+class(sites.patches2$Patch.Type)
+sites.patches2$Patch.Type <- as.factor(sites.patches2$Patch.Type)
+
+# main observed substrate may not match patch type as patch coverage can overlap
+
+# library
+library(multcompView)
+library(rstatix)
+par(mar = c(3, 7, 3, 3))
+
+ 
+# What is the effect of the treatment on the value ?
+model=lm( sites.patches2$Simpson ~ sites.patches2$Main.Substrate )
+ANOVA=aov(model)
+ 
+# Tukey test to study each pair of treatment :
+TUKEY1 <- TukeyHSD(x=ANOVA, 'sites.patches2$Main.Substrate', conf.level=0.95)
+ 
+# Tuckey test representation :
+plot(TUKEY1 , las=1 , col="brown")
+
+# basic exploration
+ggboxplot(sites.patches2, x="Main.Substrate", y="Simpson")
+
+# Build the linear model - simpsons
+model.1  <- lm(Simpson ~ Main.Substrate, data = sites.patches2)
+ggqqplot(residuals(model.1))
+# Compute Shapiro-Wilk test of normality
+shapiro_test(residuals(model.1))
+sites.patches %>%
+  group_by(Main.Substrate) %>%
+  shapiro_test(Simpson)
+ggqqplot(sites.patches2, "Simpson", facet.by = "Main.Substrate")
+sites.patches2 %>% levene_test(Simpson ~ Main.Substrate)
+
+#perform Kruskal-Wallis Test
+k.test <- sites.patches2 %>% kruskal_test(Simpson ~ Main.Substrate)
+k.test
+sites.patches2 %>% kruskal_effsize(Simpson ~ Main.Substrate)
+## a small effect size eta2[H] = 0.018
+
+# Pairwise comparisons
+pwc.1 <- sites.patches2 %>% 
+  dunn_test(Simpson ~ Main.Substrate, p.adjust.method = "bonferroni") 
+pwc.1
+
+pwc.1b <- sites.patches2 %>% 
+  wilcox_test(Simpson ~ Main.Substrate, p.adjust.method = "bonferroni")
+pwc.1b
+
+# Visualization: box plots with p-values
+ggqqplot(sites.patches2, "Simpson", facet.by = "Main.Substrate")
+
+pwc.1 <- pwc.1 %>% add_xy_position(x = "Main.Substrate")
+box.pwc.1 <- ggboxplot(sites.patches2, x= "Main.Substrate", y= "Simpson", bxp.errorbar = TRUE, outlier.shape = NA, varwidth=FALSE, fill="Main.Substrate") +
+  stat_pvalue_manual(pwc.1, hide.ns = TRUE) +
+  stat_summary(fun.data = mean_se, geom="point", shape=4, size=8, colour="blue", stroke=1.5, show.legend=FALSE) +
+  scale_fill_grey() +
+  stat_n_text() +
+  theme_bw() +
+  ylab("Simpson's diversity Index")+
+  labs(subtitle = get_test_label(k.test, detailed = TRUE),
+    caption = get_pwc_label(pwc.1))+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank())
+box.pwc.1
+
+
+##### do the same but between fishing measurs not substrata #####
+
+
+names(sites.patches2)
+# Assuming 'Simpson' is the response variable and 'Limits' is the factor variable
+model2 <- aov(Simpson ~ factor(Limits), data = sites.patches2)
+
+# Perform ANOVA
+ANOVA <- anova(model2)
+
+# Tukey test to study each pair of treatment:
+TUKEY2 <- TukeyHSD(model2, "factor(Limits)", conf.level = 0.95)
+ 
+# Tuckey test representation :
+plot(TUKEY2 , las=1 , col="brown")
+
+# basic exploration
+ggboxplot(sites.patches2, x="Limits", y="Simpson")
+
+# Build the linear model - simpsons
+model.2  <- lm(Simpson ~ Limits, data = sites.patches2)
+ggqqplot(residuals(model.2))
+# Compute Shapiro-Wilk test of normality
+shapiro_test(residuals(model.2))
+sites.patches2 %>%
+  group_by(Main.Substrate) %>%
+  shapiro_test(Simpson)
+ggqqplot(sites.patches2, "Simpson", facet.by = "Limits")
+sites.patches2 %>% levene_test(Simpson ~ Limits)
+
+#perform Kruskal-Wallis Test
+k.test2 <- sites.patches2 %>% kruskal_test(Simpson ~ Limits)
+k.test2
+sites.patches2 %>% kruskal_effsize(Simpson ~ Limits)
+## a small effect size eta2[H] = 0.008
+
+# Pairwise comparisons
+pwc.2 <- sites.patches2 %>% 
+  dunn_test(Simpson ~ Limits, p.adjust.method = "bonferroni") 
+pwc.2
+
+# Visualization: box plots with p-values
+ggqqplot(sites.patches2, "Simpson", facet.by = "Limits")
+
+pwc.2 <- pwc.2 %>% add_xy_position(x = "Limits")
+box.pwc.2 <- ggboxplot(sites.patches2, x= "Limits", y= "Simpson", fill = 'Limits', bxp.errorbar = TRUE, outlier.shape = NA, varwidth=TRUE) +
+  stat_pvalue_manual(pwc.2, hide.ns = TRUE) +
+  stat_summary(fun.data = mean_se, geom="point", shape=4, size=8, colour="blue", stroke=1.5, show.legend=FALSE) +
+  ylab("Simpson's diversity Index")+
+  stat_n_text() +
+  scale_fill_grey() +
+  labs(subtitle = get_test_label(k.test2, detailed = TRUE),
+  caption = get_pwc_label(pwc.2))+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x=element_blank())
+box.pwc.2
+
+
+```
+
+
