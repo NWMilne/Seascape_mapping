@@ -1656,19 +1656,21 @@ compareCRS(algae.clump1, measures.proj)
 algae.clump1
 
 algae.patche.map <- ggplot() +
-  geom_sf(data=cropped)+
-  geom_sf(data=measures.2.prj, fill=NA, size=1)+
-  ggtitle("Algae")+
   geom_raster(data=algae.patches.df, aes(x=Longitude, y=Latitude, fill=Algae.patches)) +
+  geom_sf(data=measures.2.prj, fill=NA, size=2)+
+  geom_sf(data=cropped)+
+  ggtitle("Algae")+
   scale_fill_viridis_d(option = "B", direction = -1) +
   annotation_scale(location = "bl", width_hint = 0.5) +
   annotation_north_arrow(location = "bl", which_north = "true", 
-                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
+                         pad_x = unit(0.25, "in"), pad_y = unit(6.5, "in"),
                          style = north_arrow_fancy_orienteering) +
   theme_bw() +
   theme(panel.grid.major = element_blank(), 
         panel.grid.minor = element_blank(),
                 legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
         axis.title.x=element_blank(), 
         axis.title.y=element_blank())
 algae.patche.map
@@ -1691,58 +1693,21 @@ gravel.patches.df$Gravel.patches <- as.factor(gravel.patches.df$Gravel.patches)
 
 
 gravel.patches.map <- ggplot() +
-  geom_sf() +
-  ggtitle("Gravel")+
   geom_raster(data=gravel.patches.df, aes(x=Longitude, y=Latitude, fill=Gravel.patches), alpha=0.8) +
-     scale_fill_viridis_d(option = "B", direction = -1) +
-    geom_sf(data=measures.2.prj, fill=NA, size=1)+
-    geom_sf(data=cropped)+
-  annotation_scale(location = "bl", width_hint = 0.5) +
-  annotation_north_arrow(location = "bl", which_north = "true", 
-                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
-                         style = north_arrow_fancy_orienteering) +
-     theme_bw() +
+  geom_sf(data=measures.2.prj, fill=NA, size=1)+
+  geom_sf(data=cropped)+
+  scale_fill_viridis_d(option = "B", direction = -1) +
+  ggtitle("Gravel")+
+  theme_bw() +
   theme(panel.grid.major = element_blank(), 
         panel.grid.minor = element_blank(),
                 legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
         axis.title.x=element_blank(), 
         axis.title.y=element_blank())
 gravel.patches.map 
 
-
-gravel.patches <- (substrate.agg3)[[2]]
-plot(gravel.patches)
-gravel.clump1 <- clump(gravel.patches)
-crs(gravel.clump1) <- CRS(the_crs)
-class(gravel.clump1)
-gravel.patches.spdf <- as(gravel.clump1, "SpatialPixelsDataFrame")
-gravel.patches.df <- as.data.frame(gravel.patches.spdf)
-names(gravel.patches.df)
-colnames(gravel.patches.df) <- c("Gravel.patches", "Longitude", "Latitude")
-summary(gravel.patches.df)
-plot(gravel.patches.df)
-class(gravel.patches.df$Gravel.patches)
-gravel.patches.df$Gravel.patches <- as.factor(gravel.patches.df$Gravel.patches)
-
-
-gravel.patches.map <- ggplot() +
-  geom_sf() +
-  ggtitle("Gravel")+
-  geom_raster(data=gravel.patches.df, aes(x=Longitude, y=Latitude, fill=Gravel.patches), alpha=0.8) +
-     scale_fill_viridis_d(option = "B", direction = -1) +
-    geom_sf(data=measures.2.prj, fill=NA, size=1)+
-    geom_sf(data=cropped)+
-  annotation_scale(location = "bl", width_hint = 0.5) +
-  annotation_north_arrow(location = "bl", which_north = "true", 
-                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
-                         style = north_arrow_fancy_orienteering) +
-     theme_bw() +
-  theme(panel.grid.major = element_blank(), 
-        panel.grid.minor = element_blank(),
-                legend.position = "none",
-        axis.title.x=element_blank(), 
-        axis.title.y=element_blank())
-gravel.patches.map
 
 #### Mud ####
 mud.patches <- (substrate.agg3)[[3]]
@@ -1761,20 +1726,17 @@ mud.patches.df$Mud.patches <- as.factor(mud.patches.df$Mud.patches)
 
 
 mud.patches.map <- ggplot() +
-  geom_sf() +
-  ggtitle("Mud")+
-  geom_raster(data=mud.patches.df, aes(x=Longitude, y=Latitude, fill=Mud.patches), alpha=0.8) +
-     scale_fill_viridis_d(option = "B", direction = -1) +
-    geom_sf(data=measures.2.prj, fill=NA, size=1)+
-    geom_sf(data=cropped)+
-  annotation_scale(location = "bl", width_hint = 0.5) +
-  annotation_north_arrow(location = "bl", which_north = "true", 
-                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
-                         style = north_arrow_fancy_orienteering) +
-     theme_bw() +
+   geom_raster(data=mud.patches.df, aes(x=Longitude, y=Latitude, fill=Mud.patches), alpha=0.8) +
+   geom_sf(data=measures.2.prj, fill=NA, size=1)+
+   geom_sf(data=cropped)+
+   scale_fill_viridis_d(option = "B", direction = -1) +
+   ggtitle("Mud")+
+  theme_bw() +
   theme(panel.grid.major = element_blank(), 
         panel.grid.minor = element_blank(),
-                legend.position = "none",
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
         axis.title.x=element_blank(), 
         axis.title.y=element_blank())
 mud.patches.map
@@ -1794,20 +1756,15 @@ pebble.patches.df$Pebble.patches <- as.factor(pebble.patches.df$Pebble.patches)
 
 
 pebble.patches.map <- ggplot() +
-  geom_sf() +
-  ggtitle("Pebble")+
   geom_raster(data=pebble.patches.df, aes(x=Longitude, y=Latitude, fill=Pebble.patches), alpha=0.8) +
-     scale_fill_viridis_d(option = "B", direction = -1) +
-    geom_sf(data=measures.2.prj, fill=NA, size=1)+
-    geom_sf(data=cropped)+
-  annotation_scale(location = "bl", width_hint = 0.5) +
-  annotation_north_arrow(location = "bl", which_north = "true", 
-                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
-                         style = north_arrow_fancy_orienteering) +
-     theme_bw() +
+  geom_sf(data=measures.2.prj, fill=NA, size=1)+
+  geom_sf(data=cropped)+
+  scale_fill_viridis_d(option = "B", direction = -1) +
+  ggtitle("Pebble")+
+  theme_bw() +
   theme(panel.grid.major = element_blank(), 
         panel.grid.minor = element_blank(),
-                legend.position = "none",
+        legend.position = "none",
         axis.title.x=element_blank(), 
         axis.title.y=element_blank())
 pebble.patches.map
@@ -1827,20 +1784,17 @@ sand.patches.df$Sand.patches <- as.factor(sand.patches.df$Sand.patches)
 
 
 sand.patches.map <- ggplot() +
-  geom_sf() +
-  ggtitle("Sand")+
   geom_raster(data=sand.patches.df, aes(x=Longitude, y=Latitude, fill=Sand.patches), alpha=0.8) +
-     scale_fill_viridis_d(option = "B", direction = -1) +
-    geom_sf(data=measures.2.prj, fill=NA, size=1)+
-    geom_sf(data=cropped)+
-  annotation_scale(location = "bl", width_hint = 0.5) +
-  annotation_north_arrow(location = "bl", which_north = "true", 
-                         pad_x = unit(0.25, "in"), pad_y = unit(4.5, "in"),
-                         style = north_arrow_fancy_orienteering) +
-     theme_bw() +
+  geom_sf(data=measures.2.prj, fill=NA, size=1)+
+  geom_sf(data=cropped)+
+  scale_fill_viridis_d(option = "B", direction = -1) +
+  ggtitle("Sand")+
+  theme_bw() +
   theme(panel.grid.major = element_blank(), 
         panel.grid.minor = element_blank(),
-                legend.position = "none",
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),        
         axis.title.x=element_blank(), 
         axis.title.y=element_blank())
 sand.patches.map
@@ -1861,16 +1815,17 @@ div.patches.df$Div.patches <- as.factor(div.patches.df$Div.patches)
 summary(div.patches.df)
 
 div.patches.map <- ggplot() +
-  geom_sf() +
-  ggtitle("Diversity")+
   geom_tile(data=div.patches.df, aes(x=Longitude, y=Latitude, fill=Div.patches), alpha=0.8) +
-     scale_fill_viridis_d(option = "B", direction = -1) +
-    geom_sf(data=measures.2.prj, fill=NA, size=1)+
-    geom_sf(data=cropped)+
-     theme_bw() +
+  geom_sf(data=measures.2.prj, fill=NA, size=1)+
+  geom_sf(data=cropped)+
+  scale_fill_viridis_d(option = "B", direction = -1) +
+  ggtitle("Diversity")+
+  theme_bw() +
   theme(panel.grid.major = element_blank(), 
         panel.grid.minor = element_blank(),
-                legend.position = "none",
+        legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),  
         axis.title.x=element_blank(), 
         axis.title.y=element_blank())
 div.patches.map
@@ -1882,7 +1837,6 @@ library(ggpubr)
 patch.clumps<- ggarrange(algae.patche.map,gravel.patches.map,mud.patches.map,pebble.patches.map,sand.patches.map,div.patches.map,ncol = 3, nrow = 2)
 # Annotate the figure by adding a common labels
 annotate_figure(patch.clumps,
-                top = text_grob("Identifyed substrate patches", color = "black", face = "bold", size = 14),
                 left = text_grob("Latitude", color = "black", rot=90),
                 bottom = text_grob("Longitude", color = "black"))
 
